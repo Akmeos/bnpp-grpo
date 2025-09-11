@@ -61,3 +61,24 @@ logs/
 .cache/
 .mypy_cache/
 .pytest_cache/
+# OS / caches
+.DS_Store
+__pycache__/
+.ipynb_checkpoints/
+*.log
+
+# Environnements
+.venv/
+env/
+venv/
+*.env
+
+# Poids / artefacts / TB
+outputs/
+output/
+**/runs/
+*.pt
+*.safetensors
+*.bin
+*.ckpt
+*.tfevents*
