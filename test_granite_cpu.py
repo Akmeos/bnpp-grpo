@@ -1,54 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import torch
-from config import Config
-from model_loader import load_model_and_tokenizer
 
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+MODEL = "ibm-granite/granite-3.1-1b-a400m-instruct"
 
 def main():
-    cfg = Config()
-    # Forcer un smoke test **CPU** pour éviter les bugs MPS avec PEFT/Granite sur Mac
-    cfg.use_gpu = False
-    prefer_mps = False   # <- clé : on évite MPS
+    print("Chargement modèle/tokenizer (CPU)…")
+    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
 
-    print("Chargement modèle/tokenizer…")
-    model, tokenizer = load_model_and_tokenizer(
-        model_name=cfg.model_name,
-        trust_remote_code=cfg.trust_remote_code,
-        use_gpu=cfg.use_gpu,
-        prefer_mps=prefer_mps,
-        lora_target_modules=cfg.lora_target_modules,
-        lora_r=cfg.lora_r,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout,
-        freeze_experts=cfg.freeze_experts,
-        train_router=cfg.train_router,
-    )
-
-    device = next(model.parameters()).device
-    print(f"Modèle chargé sur : {device}")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL, trust_remote_code=True, torch_dtype=torch.float32, device_map=None
+    ).to("cpu")
 
     prompt = (
         "You are a careful math tutor. Solve step by step.\n\n"
-        "Question: If I have 3 apples and buy 4 more, how many apples do I have?\nAnswer:"
+        "Question: If I have 3 apples and buy 4 more, how many apples do I have?\n"
+        "Answer:"
     )
-
-    inputs = tokenizer(prompt, return_tensors="pt")
-    # IMPORTANT : mettre les tenseurs sur le **même device** que le modèle
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=32,
-            do_sample=False,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-
-    print("\n==== Sortie ====")
-    print(tokenizer.decode(out[0], skip_special_tokens=True))
-
+    inputs = tok(prompt, return_tensors="pt")
+    out = model.generate(
+        **inputs,
+        max_new_tokens=64,
+        do_sample=False,
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.pad_token_id,
+    )
+    print("\n==== Sortie ====\n")
+    print(tok.decode(out[0], skip_special_tokens=True))
 
 if __name__ == "__main__":
     main()

@@ -2,11 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import os
 import random
 import time
-import threading
-from typing import Optional
 
 import numpy as np
 import torch
@@ -25,68 +22,10 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-# ------- NVML sampler (optionnel, pour pic VRAM global) -------
-class GPUMemorySampler:
-    """
-    Échantillonne la VRAM utilisée (global driver) pendant l'entraînement.
-    Utile pour capturer l'usage vLLM/Autres lib hors tracking PyTorch.
-    Requiert: pip install pynvml (sur la machine GPU).
-    """
-    def __init__(self, device_index: int = 0, interval_sec: float = 0.5):
-        self.device_index = device_index
-        self.interval_sec = interval_sec
-        self.peak_bytes = 0
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._ok = False
-        try:
-            import pynvml  # type: ignore
-            self.nvml = pynvml
-            self.nvml.nvmlInit()
-            self.handle = self.nvml.nvmlDeviceGetHandleByIndex(self.device_index)
-            self._ok = True
-        except Exception:
-            self._ok = False
-
-    def start(self):
-        if not self._ok:
-            return
-
-        def loop():
-            while not self._stop.is_set():
-                try:
-                    info = self.nvml.nvmlDeviceGetMemoryInfo(self.handle)
-                    # info.used en bytes
-                    if info.used > self.peak_bytes:
-                        self.peak_bytes = info.used
-                except Exception:
-                    pass
-                time.sleep(self.interval_sec)
-
-        self._thread = threading.Thread(target=loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        if not self._ok:
-            return
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-        try:
-            self.nvml.nvmlShutdown()
-        except Exception:
-            pass
-
-    @property
-    def available(self) -> bool:
-        return self._ok
-
-
-# ------- Profils d’exécution -------
 def build_cfg_from_profile(profile: str, args) -> Config:
     cfg = Config()
 
-    # overrides via CLI
+    # Overrides via CLI
     if args.output_dir:
         cfg.output_dir = args.output_dir
     if args.samples is not None:
@@ -99,12 +38,10 @@ def build_cfg_from_profile(profile: str, args) -> Config:
         cfg.report_to = "tensorboard"
 
     if profile == "local":
-        # CPU / Mac — run court
         cfg.use_gpu = False
         cfg.max_train_samples = cfg.max_train_samples or 32
         cfg.max_new_tokens = cfg.max_new_tokens or 32
-        if args.temperature is None:
-            cfg.temperature = 0.0
+        cfg.temperature = 0.0 if args.temperature is None else cfg.temperature
         cfg.per_device_train_batch_size = 1
         cfg.gradient_accumulation_steps = 1
         cfg.num_train_epochs = 1
@@ -112,22 +49,26 @@ def build_cfg_from_profile(profile: str, args) -> Config:
         cfg.dataloader_num_workers = 0
 
     elif profile == "gpu":
-        # Cloud — 1x GPU <= 16 Go
         cfg.use_gpu = True
-        cfg.use_bf16 = True          # ou fp16 si bf16 non dispo
+        cfg.use_bf16 = False   # T4: False
+        cfg.use_fp16 = True
         cfg.use_vllm = not args.no_vllm
         cfg.vllm_mode = "colocate"
-        cfg.vllm_gpu_memory_utilization = 0.45
+        cfg.vllm_gpu_memory_utilization = 0.40
         cfg.max_new_tokens = cfg.max_new_tokens or 64
-        if args.temperature is None:
-            cfg.temperature = 0.7
+        cfg.temperature = 0.8 if args.temperature is None else cfg.temperature
         cfg.per_device_train_batch_size = 1
         cfg.gradient_accumulation_steps = 8
         cfg.num_train_epochs = 1
+        cfg.dataloader_num_workers = 0
     else:
         raise ValueError(f"Profil inconnu: {profile}")
 
     return cfg
+
+
+def format_gb(b: int) -> str:
+    return f"{b / (1024 ** 3):.2f} GB"
 
 
 def main():
@@ -148,9 +89,13 @@ def main():
     parser.add_argument("--no-vllm", action="store_true",
                         help="(GPU) Désactiver vLLM.")
     parser.add_argument("--track-mem", action="store_true",
-                        help="Mesurer la VRAM max (PyTorch + NVML si dispo).")
-    parser.add_argument("--nvml-interval", type=float, default=0.5,
-                        help="Période d'échantillonnage NVML en secondes.")
+                        help="Afficher la VRAM max PyTorch (CUDA uniquement).")
+    parser.add_argument("--num-generations", type=int, default=2,
+                        help="Nombre de générations par prompt (GRPO ≥ 2).")
+    parser.add_argument("--gen-batch-size", type=int, default=2,
+                        help="Taille batch génération (multiple de --num-generations).")
+    parser.add_argument("--disable-tqdm", action="store_true",
+                        help="Masquer la barre de progression.")
     args = parser.parse_args()
 
     cfg = build_cfg_from_profile(args.profile, args)
@@ -172,7 +117,7 @@ def main():
         model_name=cfg.model_name,
         trust_remote_code=cfg.trust_remote_code,
         use_gpu=cfg.use_gpu,
-        prefer_mps=False,  # éviter MPS avec PEFT
+        prefer_mps=False,  # éviter MPS
         lora_target_modules=cfg.lora_target_modules,
         lora_r=cfg.lora_r,
         lora_alpha=cfg.lora_alpha,
@@ -181,33 +126,15 @@ def main():
         train_router=cfg.train_router,
     )
 
-    # GRPO (2 générations mini)
-    num_generations = 2
-    generation_batch_size = 2
-
-    # --- Tracking mémoire ---
-    if args.track-mem if False else False:
-        # (éviter parse error; voir bloc juste après)
-        pass
-    # correct implementation:
-    nvml_sampler = None
+    # Mémoire PyTorch
     if args.track_mem and torch.cuda.is_available():
-        # Reset des stats PyTorch
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        # NVML sampler (optionnel)
-        nvml_sampler = GPUMemorySampler(device_index=0, interval_sec=args.nvml_interval)
-        if nvml_sampler.available:
-            nvml_sampler.start()
-        else:
-            nvml_sampler = None
 
-    # --- Entraînement + timing ---
     start = time.perf_counter()
 
     trainer = GRPOTrainerWrapper(
         model=model,
-        tokenizer=tokenizer,
         train_dataset=train_ds,
         output_dir=cfg.output_dir,
         seed=cfg.seed,
@@ -232,9 +159,12 @@ def main():
         max_new_tokens=cfg.max_new_tokens,
         temperature=cfg.temperature,
         top_p=cfg.top_p,
-        num_generations=num_generations,
-        generation_batch_size=generation_batch_size,
+        num_generations=args.num_generations,
+        generation_batch_size=args.gen_batch_size,
         max_steps=args.max_steps,
+        disable_tqdm=args.disable_tqdm,
+        reward_format_bonus=cfg.reward_format_bonus,
+        reward_missing_penalty=cfg.reward_missing_penalty,
     )
 
     trainer.train()
@@ -242,29 +172,20 @@ def main():
 
     elapsed = time.perf_counter() - start
 
-    # Arrêt sampler NVML si actif
-    if nvml_sampler is not None:
-        nvml_sampler.stop()
-
-    # --- Reporting métriques runtime/mémoire ---
-    print("\n================ Runtime & Mémoire ================")
+    # Reporting
+    print("\n================ Runtime & Mémoire (PyTorch) ================")
     print(f"Temps d'entraînement (mur): {elapsed:.2f} s")
-    if torch.cuda.is_available():
-        # Mémoire PyTorch (process courant)
-        peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
-        peak_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
-        print(f"PyTorch CUDA peak — allocated: {peak_alloc:.2f} GB | reserved: {peak_reserved:.2f} GB")
-        # Mémoire globale observée via NVML (si dispo)
-        if nvml_sampler is not None:
-            peak_nvml = nvml_sampler.peak_bytes / (1024 ** 3)
-            print(f"NVML peak observed (global): {peak_nvml:.2f} GB")
-            if peak_nvml > 16.0:
-                print("⚠️  Alerte: pic VRAM > 16 Go (condition dépassée).")
+    if args.track_mem:
+        if torch.cuda.is_available():
+            peak_alloc = torch.cuda.max_memory_allocated()
+            peak_reserved = torch.cuda.max_memory_reserved()
+            print(f"CUDA peak allocated : {format_gb(peak_alloc)}")
+            print(f"CUDA peak reserved  : {format_gb(peak_reserved)}")
+            if peak_reserved > 16 * 1024 ** 3:
+                print("⚠️  Alerte: pic VRAM réservée > 16 Go (condition dépassée).")
         else:
-            print("(NVML indisponible — pic VRAM global non échantillonné)")
-    else:
-        print("CUDA non disponible — pas de VRAM à reporter (CPU/MPS).")
-    print("===================================================\n")
+            print("CUDA non disponible — aucune VRAM à reporter (CPU/MPS).")
+    print("=============================================================\n")
 
     print(f"Entraînement GRPO terminé. Modèle sauvegardé dans: {cfg.output_dir}")
 

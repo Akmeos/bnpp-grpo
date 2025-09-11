@@ -1,56 +1,56 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 from datasets import load_dataset, Dataset
 
+SYSTEM_PROMPT = (
+    "You are a careful math tutor. Solve step by step. "
+    "At the very end, write ONLY the final numeric answer on a new line as '#### <number>' "
+    "and then STOP."
+)
 
-def _build_prompt(question: str) -> str:
-    # On force la forme de sortie compatible GSM8K pour faciliter la reward
+def build_prompt(question: str) -> str:
     return (
-        "You are a careful math tutor. Solve step by step. "
-        "At the very end, write ONLY the final numeric answer on a new line as '#### <number>'.\n\n"
-        f"Question: {question}\nAnswer:"
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Question: {question}\n"
+        f"Answer:"
     )
 
-
-def load_gsm8k_as_prompts(
+def prepare_train_eval(
     dataset_name: str = "gsm8k",
     dataset_config: str = "main",
-    split: str = "train",
-    limit: Optional[int] = None,
-) -> Dataset:
-    """
-    Retourne un Dataset HF avec colonnes:
-    - 'prompt': texte complet à donner au modèle
-    - 'answer': gold (contient souvent '#### 42')
-    """
-    ds = load_dataset(dataset_name, dataset_config, split=split)
-
-    def _map_fn(example: Dict[str, Any]) -> Dict[str, Any]:
-        q = example.get("question", "").strip()
-        a = example.get("answer", "").strip()
-        return {"prompt": _build_prompt(q), "answer": a}
-
-    keep = {"prompt", "answer"}
-    ds = ds.map(_map_fn, remove_columns=[c for c in ds.column_names if c not in keep])
-    if limit is not None:
-        ds = ds.select(range(min(limit, len(ds))))
-    return ds
-
-
-def prepare_train_eval(
-    dataset_name: str,
-    dataset_config: str,
-    train_split: str,
-    eval_split: Optional[str],
-    max_train_samples: Optional[int],
-    max_eval_samples: Optional[int],
+    train_split: str = "train",
+    eval_split: Optional[str] = None,
+    max_train_samples: Optional[int] = None,
+    max_eval_samples: Optional[int] = None,
 ) -> Dict[str, Dataset]:
-    train_ds = load_gsm8k_as_prompts(dataset_name, dataset_config, train_split, max_train_samples)
-    data = {"train": train_ds}
+    # --- train ---
+    ds_train = load_dataset(dataset_name, dataset_config, split=train_split)
+    ds_train = ds_train.map(
+        lambda ex: {
+            "prompt": build_prompt(ex["question"]),
+            "answer": ex["answer"],  # texte complet GSM8K (contient '#### <nombre>')
+        },
+        remove_columns=ds_train.column_names,  # ne conserver que ce que l'on retourne
+    )
+    if max_train_samples is not None:
+        ds_train = ds_train.select(range(min(max_train_samples, len(ds_train))))
+
+    out: Dict[str, Dataset] = {"train": ds_train}
+
+    # --- eval (optionnel) ---
     if eval_split:
-        eval_ds = load_gsm8k_as_prompts(dataset_name, dataset_config, eval_split, max_eval_samples)
-        data["eval"] = eval_ds
-    return data
+        ds_eval = load_dataset(dataset_name, dataset_config, split=eval_split)
+        ds_eval = ds_eval.map(
+            lambda ex: {
+                "prompt": build_prompt(ex["question"]),
+                "answer": ex["answer"],
+            },
+            remove_columns=ds_eval.column_names,
+        )
+        if max_eval_samples is not None:
+            ds_eval = ds_eval.select(range(min(max_eval_samples, len(ds_eval))))
+        out["eval"] = ds_eval
+
+    return out
