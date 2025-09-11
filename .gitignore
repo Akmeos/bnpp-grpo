@@ -1,0 +1,63 @@
+# -------- OS / Editeurs --------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# -------- Python --------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+*.spec
+__pypackages__/
+
+# -------- Environnements virtuels --------
+.env
+.venv/
+venv/
+env/
+bnpp_env/
+
+# -------- Jupyter --------
+.ipynb_checkpoints/
+
+# -------- Données (ne pas versionner le lourd) --------
+data/
+datasets/
+*.csv
+*.tsv
+*.parquet
+*.xls
+*.xlsx
+*.zip
+*.gz
+*.bz2
+*.xz
+
+# -------- Modèles & artefacts d'entrainement --------
+models/
+checkpoints/
+artifacts/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.onnx
+*.pb
+
+# -------- Logs & caches divers --------
+logs/
+*.log
+.cache/
+.mypy_cache/
+.pytest_cache/
