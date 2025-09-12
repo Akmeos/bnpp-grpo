@@ -3,9 +3,8 @@
 
 # GRPO Trainer robuste :
 # - Découpe du suffixe généré au bon offset partagé (len(input_ids))
-# - Extraction stricte du nombre en début de suffixe
+# - LogitsProcessor: boost des tokens de digits en début de suffixe (soft constraint)
 # - Reward shaping progressif (+ filet 0.05 si un nombre apparaît quelque part)
-# - Skip update si reward==0 partout
 # - PPO clip + KL (ref gelé) + entropie faible
 # - clamp/nan_to_num, greedy par défaut, fallback greedy
 # - Logs TB + debug premier batch
@@ -19,6 +18,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_scheduler
+from transformers.generation.logits_process import LogitsProcessorList, LogitsProcessor
 
 # Nombre AU DÉBUT du suffixe (ce que le modèle doit écrire)
 RE_BEGIN_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
@@ -54,6 +54,37 @@ def extract_pred_number_from_suffix_head(suffix: str) -> float | None:
         return float(m.group(1))
     except Exception:
         return None
+
+
+class DigitPrefixBoost(LogitsProcessor):
+    """
+    Ajoute un biais positif aux ids des digits (0-9, '.' et '-') pendant les
+    premiers pas de génération (longueur suffixe <= max_prefix_len).
+    Objectif : pousser le modèle à commencer par un nombre.
+    """
+    def __init__(self, tokenizer, base_len: int, boost: float = 5.0, max_prefix_len: int = 6):
+        self.base_len = base_len
+        self.max_prefix_len = max_prefix_len
+        self.boost = boost
+
+        # Construire l’ensemble des ids autorisés pour chiffres / signe / point
+        allowed_chars = list("0123456789") + ['.', '-']
+        allowed_ids = set()
+        for ch in allowed_chars:
+            ids = tokenizer.encode(ch, add_special_tokens=False)
+            if len(ids) == 1:
+                allowed_ids.add(ids[0])
+        # Dans certains BPE, '.' peut être multi-tokens : on ignore si >1
+        self.allowed_ids = list(allowed_ids) if allowed_ids else []
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # input_ids shape: [B, cur_len]
+        cur_len = input_ids.shape[1]
+        gen_len = max(0, cur_len - self.base_len)
+        if self.allowed_ids and gen_len < self.max_prefix_len:
+            # Boost sur les ids numériques
+            scores[:, self.allowed_ids] = scores[:, self.allowed_ids] + self.boost
+        return scores
 
 
 class GRPOConfig:
@@ -164,24 +195,30 @@ class GRPOTrainerWrapper:
         self.tokenizer.save_pretrained(ckpt_path)
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
 
-    def _generate(self, **inputs):
+    def _generate(self, base_len: int, **inputs):
+        # Logits processor: boost des digits sur les premiers pas
+        lp = LogitsProcessorList([DigitPrefixBoost(self.tokenizer, base_len=base_len, boost=5.0, max_prefix_len=6)])
         try:
             if self.config.do_sample:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
+                    min_new_tokens=1,
                     do_sample=True,
                     temperature=max(self.config.temperature, 1e-5),
                     top_k=self.config.top_k,
                     top_p=self.config.top_p,
                     pad_token_id=self.tokenizer.eos_token_id,
+                    logits_processor=lp,
                 )
             else:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
+                    min_new_tokens=1,
                     do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
+                    logits_processor=lp,
                 )
         except Exception as e:
             print(f"⚠️ Sampling a échoué ({e}). Fallback greedy.")
@@ -192,8 +229,10 @@ class GRPOTrainerWrapper:
             return self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
+                min_new_tokens=1,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
+                logits_processor=lp,
             )
 
     # ===== Reward shaping progressif =====
@@ -254,12 +293,12 @@ class GRPOTrainerWrapper:
                 prompts, return_tensors="pt", padding=True, truncation=True
             ).to(device)
 
-            # ✅ longueur PARTAGÉE des entrées (inclut le padding)
+            # ✅ longueur PARTAGÉE des entrées (inclut padding)
             shared_in_len = inputs["input_ids"].shape[1]
 
-            # Génération
+            # Génération avec biais digit en début de suffixe
             with torch.no_grad():
-                outputs = self._generate(**inputs)  # [B, shared_in_len + new]
+                outputs = self._generate(shared_in_len, **inputs)  # [B, shared_in_len + new]
 
             # Suffixe = tokens après shared_in_len pour chaque item
             suffixes = []
