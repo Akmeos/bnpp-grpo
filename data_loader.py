@@ -12,20 +12,23 @@ RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
 
 def clean_answer(ans: str) -> str:
     """
-    Label "propre" pour le RL :
-      - priorise le nombre après '####'
-      - sinon prend le DERNIER nombre dans le texte
-      - sinon renvoie ans.strip()
+    Extraction plus robuste des nombres de la réponse
     """
     if not ans:
         return ""
+    
+    # Priorité au nombre après ####
     m = RE_HASH.search(ans)
     if m:
         return m.group(1)
-    nums = list(RE_ANY.finditer(ans))
+    
+    # Sinon chercher le dernier nombre dans le texte
+    nums = RE_ANY.findall(ans)
     if nums:
-        return nums[-1].group(0)
-    return ans.strip()
+        return nums[-1]
+    
+    return ""
+
 
 # Prompt concis avec format imposé
 INSTR = (

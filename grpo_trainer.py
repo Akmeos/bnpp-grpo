@@ -230,7 +230,7 @@ class GRPOTrainerWrapper:
         
         # Processeur pour booster les digits après le préfixe - CORRECTION: hériter de LogitsProcessor
         class DigitAfterPrefixBoost(LogitsProcessor):
-            def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 15.0):
+            def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 8.0):
                 super().__init__()  # AJOUTER CETTE LIGNE
                 self.tokenizer = tokenizer
                 self.base_len = base_len
@@ -259,7 +259,7 @@ class GRPOTrainerWrapper:
         # Combiner les processeurs
         lp = LogitsProcessorList([
             ForcePrefixProcessor(self.tokenizer, base_len, forced_prefix_ids),
-            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=15.0)
+            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=8.0)
         ])
         
         try:
@@ -307,33 +307,38 @@ class GRPOTrainerWrapper:
     # ===== Reward shaping progressif =====
     def _reward(self, suffix: str, gold_str: str) -> float:
         """
-        Récompense basée sur le format STRICT "#### nombre" + exactitude
+        Récompense STRICTE : format "#### nombre" + exactitude numérique
         """
-        # Vérifie d'abord si le suffixe commence par "####"
+        # Vérifier que le suffixe commence par "####"
         if not suffix.strip().startswith("####"):
-            return 0.0  # Format incorrect = 0 récompense
+            return 0.0
         
-        # Extrait le nombre après "####"
-        m = RE_BEGIN_NUM.match(suffix.replace("####", "").strip())
-        if not m:
-            return 0.0  # Pas de nombre après "####" = 0 récompense
+        # Extraire le nombre après "####"
+        clean_suffix = suffix.replace("####", "").strip()
+        if not clean_suffix:
+            return 0.0
+        
+        # Prendre seulement le premier mot (le nombre)
+        first_word = clean_suffix.split()[0] if clean_suffix else ""
         
         try:
-            pred = float(m.group(1))
-            gold = extract_label_number(gold_str)
+            pred = float(first_word)
+            gold = float(gold_str) if gold_str else None
             
             if gold is None:
                 return 0.0
                 
+            # Récompense basée sur l'exactitude
             if pred == gold:
-                return 1.0  # Exact
-            elif abs(pred - gold) < 0.01:  # Tolérance pour les erreurs d'arrondi
+                return 1.0
+            elif abs(pred - gold) < 0.01:  # Tolérance pour erreurs d'arrondi
                 return 0.8
-            elif abs(pred - gold) / max(1.0, abs(gold)) < 0.1:
+            elif abs(pred - gold) / max(1.0, abs(gold)) < 0.1:  # Erreur relative < 10%
                 return 0.4
             else:
                 return 0.1  # Mauvais nombre mais bon format
-        except:
+        except (ValueError, TypeError):
+            # Si ce n'est pas un nombre valide
             return 0.0
 
     def train(self, dataloader: DataLoader):
@@ -447,10 +452,12 @@ class GRPOTrainerWrapper:
                 )
                 
             if step % 5 == 0:
-                print(f"Prompt: {prompts[0][-100:]}...")  # Afficher la fin du prompt
+                print(f"Prompt: {prompts[0][-50:]}...")
                 print(f"Suffix: '{suffixes[0]}'")
                 print(f"Gold: {golds[0]}")
+                print(f"Pred extracted: {extract_pred_number_from_suffix_head(suffixes[0])}")
                 print(f"Reward: {rewards_list[0]}")
+                print("---")
 
             if step > 0 and step % self.config.save_steps == 0:
                 self._save_checkpoint(step)
