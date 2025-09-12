@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import re
+import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
