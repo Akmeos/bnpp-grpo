@@ -8,9 +8,11 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AdamW, get_scheduler
+from transformers import get_scheduler
 from torch.utils.tensorboard import SummaryWriter
 from typing import Dict, Any
+from torch.optim import AdamW
+
 
 
 # ============ CONFIG ============
