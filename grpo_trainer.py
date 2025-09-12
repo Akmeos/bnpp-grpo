@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# GRPO Trainer robuste
+# GRPO Trainer robuste avec reward fuzzy
 # - Rewards normalisées safe
 # - PPO clip
 # - KL control avec ref_model gelé
@@ -9,18 +9,25 @@
 # - Logits clampés (évite NaN)
 # - pad_token_id défini
 # - Fallback greedy si sampling plante
-# - Checkpoints périodiques
 
 import os
 import copy
-from typing import Optional
-
+import re
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_scheduler
+
+# --- extraction du nombre final ---
+RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
+
+def extract_final_number(text: str) -> float | None:
+    if not text:
+        return None
+    m = RE_HASH.search(text)
+    return float(m.group(1)) if m else None
 
 
 class GRPOConfig:
@@ -37,7 +44,7 @@ class GRPOConfig:
         entropy_coef=0.01,
         normalize_rewards=True,
         save_steps=50,
-        do_sample=False,
+        do_sample=True,
         temperature=0.7,
         top_k=50,
         top_p=0.95,
@@ -71,8 +78,8 @@ class GRPOTrainerWrapper:
         temperature=0.7,
         new_tokens=256,
         no_vllm=True,
-        writer: Optional[SummaryWriter] = None,
-        config: Optional[GRPOConfig] = None,
+        writer: SummaryWriter = None,
+        config: GRPOConfig = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -102,8 +109,6 @@ class GRPOTrainerWrapper:
             num_training_steps=max_steps,
         )
 
-    # --------- utils ---------
-
     @staticmethod
     def _std_safe(x: torch.Tensor) -> float:
         if x.numel() <= 1:
@@ -112,6 +117,8 @@ class GRPOTrainerWrapper:
         return float(s.item()) if torch.isfinite(s) else 0.0
 
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
+        if not torch.isfinite(rewards).all():
+            return torch.zeros_like(rewards)
         if self.config.normalize_rewards:
             if rewards.numel() <= 1:
                 return rewards - rewards.mean()
@@ -133,28 +140,18 @@ class GRPOTrainerWrapper:
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
 
     def _generate(self, **inputs):
-        """Génération robuste: sampling par défaut, fallback greedy sur ANY error."""
         try:
-            if self.config.do_sample:
-                return self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.new_tokens,
-                    do_sample=True,
-                    temperature=max(self.config.temperature, 1e-5),
-                    top_k=self.config.top_k,
-                    top_p=self.config.top_p,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
-            else:
-                return self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.new_tokens,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                )
+            return self.model.generate(
+                **inputs,
+                max_new_tokens=self.new_tokens,
+                do_sample=self.config.do_sample,
+                temperature=max(self.config.temperature, 1e-5),
+                top_k=self.config.top_k,
+                top_p=self.config.top_p,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
         except Exception as e:
-            # Peu importe le message (y compris "device-side assert"), on bascule en greedy
-            print(f"⚠️ Sampling a échoué ({e}). Fallback greedy do_sample=False.")
+            print(f"⚠️ Sampling a échoué ({e}). Fallback greedy.")
             try:
                 torch.cuda.empty_cache()
             except Exception:
@@ -165,9 +162,6 @@ class GRPOTrainerWrapper:
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
-
-
-    # --------- training ---------
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -188,11 +182,30 @@ class GRPOTrainerWrapper:
                 outputs = self._generate(**inputs)
             generations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # Rewards
+            # --- Reward fuzzy ---
             rewards = []
             for gen, ans in zip(generations, answers):
-                rewards.append(1.0 if (ans and (ans in gen)) else 0.0)
+                pred = extract_final_number(gen)
+                try:
+                    gold = float(ans.strip())
+                except:
+                    gold = None
+
+                if pred is None or gold is None:
+                    rewards.append(0.0)
+                else:
+                    diff = abs(pred - gold)
+                    if diff == 0:
+                        rewards.append(1.0)
+                    elif diff < 1e-3:
+                        rewards.append(0.8)
+                    elif diff < 1.0:
+                        rewards.append(0.5)
+                    else:
+                        rewards.append(0.0)
+
             rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+            rewards = torch.clamp(rewards, 0.0, 1.0)  # ✅ évite explosions
 
             # Avantages
             advantages = self.compute_advantages(rewards)
@@ -201,7 +214,7 @@ class GRPOTrainerWrapper:
             batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
             logits = self.model(**batch_outputs).logits.float()
             logprobs = F.log_softmax(logits, dim=-1)
-            logprobs = torch.clamp(logprobs, min=-20, max=0)  # ✅ clamp pour éviter -inf/+nan
+            logprobs = torch.clamp(logprobs, min=-20, max=0)
             gen_logprobs = logprobs[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from data_loader import get_dataloaders          # ✅ correspond à ton data_loader.py
+from data_loader import get_dataloaders
 from grpo_trainer import GRPOTrainerWrapper, GRPOConfig
 from model_loader import load_model_with_lora, load_tokenizer
 
@@ -36,7 +36,8 @@ def main():
     parser.add_argument("--new-tokens", type=int, default=256)
     parser.add_argument("--max-steps", type=int, default=150)
     parser.add_argument("--temperature", type=float, default=0.7)
-    parser.add_argument("--no_vllm", action="store_true")   # gardé pour compat
+    parser.add_argument("--no_vllm", dest="no_vllm", action="store_true")
+    parser.add_argument("--no-vllm", dest="no_vllm", action="store_true")  # alias
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
     args = parser.parse_args()
@@ -61,7 +62,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token  # ✅ évite les soucis de sampling/padding
 
-    # Option de reprise (si tu as implémenté des checkpoints compatibles)
+    # Option de reprise
     if args.resume_from_checkpoint and os.path.isdir(args.resume_from_checkpoint):
         print(f"🔄 Reprise depuis {args.resume_from_checkpoint}")
         try:
@@ -73,17 +74,20 @@ def main():
     total, trainable, frozen = count_parameters(model)
     print(f"[Paramètres] Total : {total:,} | Trainables : {trainable:,} | Figés : {frozen:,}")
 
-    # DataLoader RL (strings brutes pour génération)
+    # DataLoader RL
     train_loader = get_dataloaders(
         tokenizer=tokenizer,
         num_samples=args.samples,
-        batch_size=1,          # ✅ conseillé pour PPO/GRPO
+        batch_size=1,          # ✅ PPO = batch=1 conseillé
         shuffle=True,
         max_input_tokens=768,
     )
 
-    # Trainer GRPO (config “qui pince” déjà dans grpo_trainer.py)
-    cfg = GRPOConfig(temperature=args.temperature)
+    # Trainer GRPO
+    cfg = GRPOConfig(
+        temperature=args.temperature,
+        do_sample=False,     # ✅ Greedy par défaut (stabilité Kaggle/T4)
+    )
     trainer = GRPOTrainerWrapper(
         model=model,
         tokenizer=tokenizer,
