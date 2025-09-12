@@ -6,20 +6,44 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
-# --- Extraction & nettoyage des réponses ---
+# --- Patterns numériques ---
 RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
+RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
 
 def clean_answer(ans: str) -> str:
     """
-    Nettoie une réponse GSM8K pour ne garder que le nombre final.
-    Exemple: 'The answer is #### 42' -> '42'
+    Renvoie la version 'label' la plus exploitable côté RL:
+    - Priorité au nombre après '####'
+    - Sinon, si un nombre existe dans le texte, renvoie ce nombre (dernier)
+    - Sinon, renvoie ans.strip() (fallback)
     """
     if not ans:
-        return ans
+        return ""
     m = RE_HASH.search(ans)
     if m:
         return m.group(1)
+    nums = list(RE_ANY.finditer(ans))
+    if nums:
+        return nums[-1].group(0)
     return ans.strip()
+
+
+# Petit few-shot CoT pour stabiliser la baseline
+FEW_SHOTS = """You are a helpful math tutor. Solve the problem step by step. Show concise reasoning, then provide ONLY the final numeric answer on a new line starting with '#### '.
+
+Q: If a notebook costs 3 dollars and a pen costs 2 dollars, how much do 4 notebooks and 3 pens cost in total?
+A: Let's reason step by step.
+4 notebooks cost 4 × 3 = 12 dollars.
+3 pens cost 3 × 2 = 6 dollars.
+Total = 12 + 6 = 18 dollars.
+#### 18
+
+Q: A box has 24 apples. If 3 friends share them equally, how many apples does each friend get?
+A: Let's reason step by step.
+We divide 24 apples by 3 friends: 24 ÷ 3 = 8.
+Each friend gets 8 apples.
+#### 8
+"""
 
 
 def get_dataloaders(
@@ -30,30 +54,29 @@ def get_dataloaders(
     max_input_tokens: int = 768,
 ):
     """
-    Charge GSM8K avec un prompting CoT (Chain of Thought).
-    Prépare prompts et réponses attendues.
+    Charge GSM8K (split 'train'), applique un prompt CoT avec few-shots,
+    et retourne un DataLoader de paires (prompt, answer_clean).
     """
 
-    dataset = load_dataset("gsm8k", "main")
+    ds = load_dataset("gsm8k", "main")
 
-    # Sélection d'un sous-échantillon pour l'entraînement rapide
-    train_data = dataset["train"].shuffle(seed=42).select(range(min(num_samples, len(dataset["train"]))))
+    # Sous-échantillon pour run rapide
+    train_data = ds["train"].shuffle(seed=42).select(range(min(num_samples, len(ds["train"]))))
 
     prompts, answers = [], []
     for ex in train_data:
         q = ex["question"]
-        a = clean_answer(ex["answer"])
+        a_clean = clean_answer(ex["answer"])
 
-        # Prompt CoT
+        # Prompt CoT : few-shot + question courante
         prompt = (
-            "You are a helpful math tutor. Solve the problem step by step. "
-            "Show concise reasoning, then provide ONLY the final numeric answer "
-            "on a new line starting with '#### '.\n\n"
-            f"Q: {q}\nA: Let's reason step by step."
+            FEW_SHOTS.strip()
+            + "\n\n"
+            + f"Q: {q}\nA: Let's reason step by step."
         )
 
         prompts.append(prompt)
-        answers.append(a)
+        answers.append(a_clean)
 
     class RLDS(torch.utils.data.Dataset):
         def __init__(self, prompts, answers):

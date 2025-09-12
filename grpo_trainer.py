@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# GRPO Trainer robuste avec reward fuzzy
-# - Rewards normalisées safe
-# - PPO clip
-# - KL control avec ref_model gelé
-# - Entropy bonus
-# - Logits clampés (évite NaN)
-# - pad_token_id défini
-# - Fallback greedy si sampling plante
+# GRPO Trainer robuste:
+# - Extraction numérique robuste (#### n puis dernier nombre)
+# - Reward fuzzy + clamp
+# - Skip update si reward==0 (évite la dérive KL/entropy)
+# - PPO clip + KL ref_model gelé + Entropy bonus
+# - nan_to_num + clamp logprobs
+# - Fallback greedy si generate() plante
 
 import os
 import copy
@@ -22,29 +21,42 @@ from transformers import get_scheduler
 
 # --- extraction du nombre final ---
 RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
+RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
 
-def extract_final_number(text: str) -> float | None:
+def extract_number_any(text: str) -> float | None:
+    """Prend '#### n' si présent, sinon le DERNIER nombre trouvé dans le texte."""
     if not text:
         return None
     m = RE_HASH.search(text)
-    return float(m.group(1)) if m else None
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+    nums = list(RE_ANY.finditer(text))
+    if nums:
+        try:
+            return float(nums[-1].group(0))
+        except Exception:
+            return None
+    return None
 
 
 class GRPOConfig:
     def __init__(
         self,
-        learning_rate=2e-4,
+        learning_rate=5e-5,      # plus bas pour éviter NaN
         weight_decay=0.01,
         warmup_steps=50,
         max_grad_norm=1.0,
         gamma=1.0,
         clip_range=0.2,
-        kl_coef=0.1,
+        kl_coef=0.05,            # un peu plus doux
         kl_target=None,
-        entropy_coef=0.01,
+        entropy_coef=0.005,      # un peu plus doux
         normalize_rewards=True,
         save_steps=50,
-        do_sample=True,
+        do_sample=False,         # greedy par défaut (Kaggle/T4)
         temperature=0.7,
         top_k=50,
         top_p=0.95,
@@ -106,7 +118,7 @@ class GRPOTrainerWrapper:
             "linear",
             self.optimizer,
             num_warmup_steps=self.config.warmup_steps,
-            num_training_steps=max_steps,
+            num_training_steps=max(self.max_steps, 1),
         )
 
     @staticmethod
@@ -117,8 +129,8 @@ class GRPOTrainerWrapper:
         return float(s.item()) if torch.isfinite(s) else 0.0
 
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        if not torch.isfinite(rewards).all():
-            return torch.zeros_like(rewards)
+        # remplace NaN/Inf par 0
+        rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=0.0)
         if self.config.normalize_rewards:
             if rewards.numel() <= 1:
                 return rewards - rewards.mean()
@@ -174,7 +186,7 @@ class GRPOTrainerWrapper:
             prompts = batch["prompts"]
             answers = batch["answers"]
 
-            # Prompts
+            # Tokenize prompts
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
             # Génération
@@ -182,12 +194,11 @@ class GRPOTrainerWrapper:
                 outputs = self._generate(**inputs)
             generations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # --- Reward fuzzy ---
+            # --- Reward fuzzy robuste ---
             rewards = []
             for gen, ans in zip(generations, answers):
-                pred = extract_final_number(gen)
-                gold = extract_final_number(ans)
-
+                pred = extract_number_any(gen)
+                gold = extract_number_any(ans)
                 if pred is None or gold is None:
                     rewards.append(0.0)
                 else:
@@ -202,31 +213,45 @@ class GRPOTrainerWrapper:
                         rewards.append(0.0)
 
             rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-            rewards = torch.clamp(rewards, 0.0, 1.0)  # ✅ évite explosions
+            rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
+
+            # --- Skip update si reward==0 partout (évite divergence KL/entropy) ---
+            if float(rewards.sum().item()) == 0.0:
+                if self.writer:
+                    self.writer.add_scalar("reward/mean", 0.0, self.global_step)
+                    self.writer.add_scalar("reward/std", 0.0, self.global_step)
+                if step % 10 == 0:
+                    print(f"[Step {step}] skip update (all rewards=0)")
+                self.global_step += 1
+                continue
 
             # Avantages
             advantages = self.compute_advantages(rewards)
 
-            # Logprobs modèle courant
+            # Re-tokenize generations
             batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
-            logits = self.model(**batch_outputs).logits.float()
+
+            # Logits du modèle courant (float32 + nan_to_num)
+            logits = self.model(**batch_outputs).logits
+            logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
             logprobs = F.log_softmax(logits, dim=-1)
-            logprobs = torch.clamp(logprobs, min=-20, max=0)
+            logprobs = torch.clamp(torch.nan_to_num(logprobs, nan=-20.0), min=-20, max=0)
             gen_logprobs = logprobs[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
-            # Ref logprobs
+            # Ref logprobs (gelé)
             with torch.no_grad():
-                ref_logits = self.ref_model(**batch_outputs).logits.float()
-                ref_logprobs_all = F.log_softmax(ref_logits, dim=-1)
-                ref_logprobs_all = torch.clamp(ref_logprobs_all, min=-20, max=0)
-            ref_logprobs = ref_logprobs_all[:, -1, :].gather(
+                ref_logits = self.ref_model(**batch_outputs).logits
+                ref_logits = torch.nan_to_num(ref_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+                ref_lp_all = F.log_softmax(ref_logits, dim=-1)
+                ref_lp_all = torch.clamp(torch.nan_to_num(ref_lp_all, nan=-20.0), min=-20, max=0)
+            ref_logprobs = ref_lp_all[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
             # PPO
-            ratio = torch.exp(gen_logprobs - ref_logprobs)
+            ratio = torch.exp(torch.clamp(gen_logprobs - ref_logprobs, min=-20, max=20))
             unclipped = ratio * advantages
             clipped = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
             policy_loss = -torch.min(unclipped, clipped).mean()
