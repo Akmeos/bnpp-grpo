@@ -46,15 +46,30 @@ def extract_label_number(text: str) -> float | None:
 
 
 def extract_pred_number_from_suffix_head(suffix: str) -> float | None:
+    """
+    Extrait le premier nombre au début du suffixe APRÈS avoir enlevé "####"
+    """
     if not suffix:
         return None
-    m = RE_BEGIN_NUM.match(suffix.strip())
-    if not m:
+    
+    # Enlever "####" et espaces autour
+    clean_suffix = suffix.replace("####", "").strip()
+    if not clean_suffix:
         return None
-    try:
-        return float(m.group(1))
-    except Exception:
-        return None
+    
+    # Prendre seulement le premier mot (le nombre)
+    first_word = clean_suffix.split()[0] if clean_suffix else ""
+    
+    # Regex pour matcher les nombres avec point décimal et signe négatif
+    num_pattern = r"^-?\d+(?:\.\d+)?"
+    match = re.match(num_pattern, first_word)
+    
+    if match:
+        try:
+            return float(match.group(0))
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 class DigitPrefixBoost(LogitsProcessor):
@@ -313,19 +328,13 @@ class GRPOTrainerWrapper:
         if not suffix.strip().startswith("####"):
             return 0.0
         
-        # Extraire le nombre après "####"
-        clean_suffix = suffix.replace("####", "").strip()
-        if not clean_suffix:
-            return 0.0
-        
-        # Prendre seulement le premier mot (le nombre)
-        first_word = clean_suffix.split()[0] if clean_suffix else ""
+        # Extraire le nombre
+        pred = extract_pred_number_from_suffix_head(suffix)
         
         try:
-            pred = float(first_word)
             gold = float(gold_str) if gold_str else None
             
-            if gold is None:
+            if gold is None or pred is None:
                 return 0.0
                 
             # Récompense basée sur l'exactitude
@@ -338,7 +347,6 @@ class GRPOTrainerWrapper:
             else:
                 return 0.1  # Mauvais nombre mais bon format
         except (ValueError, TypeError):
-            # Si ce n'est pas un nombre valide
             return 0.0
 
     def train(self, dataloader: DataLoader):
@@ -372,6 +380,14 @@ class GRPOTrainerWrapper:
             rewards_list = [self._reward(suf, gold) for suf, gold in zip(suffixes, golds)]
             rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
             rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
+            
+            if step % 5 == 0:  # Afficher seulement tous les 5 steps
+                print(f"=== DEBUG Step {step} ===")
+                print(f"Suffix: '{suffixes[0]}'")
+                print(f"Extracted number: {extract_pred_number_from_suffix_head(suffixes[0])}")
+                print(f"Gold number: {golds[0]}")
+                print(f"Reward: {rewards_list[0]}")
+                print("========================")
 
             # Debug batch 0
             if self.config.debug_print_first_batch and step == 0:
