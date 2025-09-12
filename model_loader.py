@@ -1,81 +1,67 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
-import re
 
-MODEL_NAME = "ibm-granite/granite-3.1-1b-a400m-instruct"
 
-def set_trainable_attention_and_router(model):
+def load_model_and_tokenizer(model_name: str = "ibm-granite/granite-3.1-1b-a400m-instruct"):
     """
-    Gèle tous les paramètres sauf :
-    - Projections Q/K/V/O de l'attention
-    - Router/gating des experts
+    Charge Granite 3.1 1b a400m (MoE) + applique LoRA sur q/k/v/o_proj.
+    On gèle tous les poids, sauf :
+      - LoRA (q_proj, k_proj, v_proj, o_proj)
+      - Router MoE (router.layer.weight) -> trainable "plein"
+    Les experts restent gelés.
     """
-    n_trainable, n_frozen = 0, 0
+    print(f"Chargement du modèle {model_name} ...")
 
-    # Tout geler
-    for name, param in model.named_parameters():
-        param.requires_grad = False
-        n_frozen += param.numel()
+    # --- Tokenizer ---
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # Évite erreurs de padding à la génération
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # Définir les patterns
-    patterns = [
-        r"\b(attn|attention)\.(q_proj|k_proj|v_proj|o_proj)\b",
-        r"\b(router|gating|gate)\b",
-    ]
-
-    def is_target(name):
-        return any(re.search(pat, name) for pat in patterns)
-
-    # Dé-geler attention + router
-    for name, param in model.named_parameters():
-        if is_target(name):
-            param.requires_grad = True
-            n_trainable += param.numel()
-
-    print(f"[Paramètres] Trainables : {n_trainable:,} | Figés : {n_frozen - n_trainable:,}")
-    print("Exemples de paramètres actifs :")
-    for name, p in list((n, p) for n, p in model.named_parameters() if p.requires_grad)[:20]:
-        print("  +", name)
-
-    return model
-
-def load_model_with_lora():
-    """
-    Charge Granite 1.3B (MoE), applique LoRA sur attention et gèle les experts.
-    """
-    print(f"Chargement du modèle {MODEL_NAME} ...")
+    # --- Modèle ---
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        model_name,
         torch_dtype=torch.float16,
-        device_map="auto"
+        device_map="auto",
     )
 
-    # Appliquer LoRA sur l'attention
+    # --- Tout geler par défaut ---
+    for p in model.parameters():
+        p.requires_grad = False
+
+    # --- Dégeler router MoE (plein entraînement du routeur) ---
+    for name, p in model.named_parameters():
+        # Granite MoE: "block_sparse_moe.router.layer.weight"
+        if "block_sparse_moe.router.layer.weight" in name:
+            p.requires_grad = True
+
+    # --- LoRA sur les proj d'attention ---
     lora_cfg = LoraConfig(
         r=8,
         lora_alpha=16,
         lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # attention uniquement
-        task_type="CAUSAL_LM"
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # attention seulement
+        task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_cfg)
 
-    # Forcer seulement attention + router comme trainables
-    model = set_trainable_attention_and_router(model)
-
+    # --- Debug: affichage des paramètres entraînables ---
     model.print_trainable_parameters()
-    return model
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[Paramètres] Total : {total_params:,} | Trainables : {trainable_params:,} | Figés : {total_params - trainable_params:,}")
 
-def load_tokenizer():
-    """
-    Charge le tokenizer de Granite.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    return tokenizer
+    # Exemple de noms trainables (utile pour valider router + lora)
+    shown = 0
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            print(f"  + {n}")
+            shown += 1
+            if shown >= 20:
+                break
+
+    return model, tokenizer

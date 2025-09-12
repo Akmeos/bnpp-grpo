@@ -29,8 +29,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="outputs/grpo-granite")
     parser.add_argument("--log_dir", type=str, default="outputs/logs")
     parser.add_argument("--samples", type=int, default=64)
-    parser.add_argument("--new-tokens", type=int, default=128)
-    parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument("--new-tokens", type=int, default=32)   # court car '#### ' imposé
+    parser.add_argument("--max-steps", type=int, default=120)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_checkpoint", type=str, default=None)
@@ -46,7 +46,10 @@ def main():
     # --- Meta run ---
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "run_meta.json"), "w") as f:
-        f.write(f'{{"seed": {args.seed}, "samples": {args.samples}, "max_steps": {args.max_steps}}}\n')
+        f.write(
+            f'{{"seed": {args.seed}, "samples": {args.samples}, '
+            f'"max_steps": {args.max_steps}, "new_tokens": {args.new_tokens}}}\n'
+        )
     print(f"ℹ️ Meta run sauvegardée dans {args.output_dir}/run_meta.json")
 
     # --- Charger modèle + tokenizer ---
@@ -63,15 +66,17 @@ def main():
 
     # --- Config GRPO ---
     cfg = GRPOConfig(
-        learning_rate=2e-4,
+        learning_rate=5e-5,     # stable sur T4
         weight_decay=0.01,
         warmup_steps=50,
         max_grad_norm=1.0,
         clip_range=0.2,
-        kl_coef=0.1,
-        entropy_coef=0.001,   # ✅ réduit pour éviter explosion d'entropie
+        kl_coef=0.05,
+        entropy_coef=0.001,     # entropie faible
         normalize_rewards=True,
         save_steps=50,
+        do_sample=False,        # greedy => évite erreurs multinomial CUDA
+        temperature=args.temperature,
     )
 
     # --- Trainer ---
@@ -80,7 +85,7 @@ def main():
         tokenizer,
         output_dir=args.output_dir,
         max_steps=args.max_steps,
-        temperature=args.temperature,  # ✅ placé ici
+        temperature=args.temperature,
         new_tokens=args.new_tokens,
         writer=writer,
         config=cfg,

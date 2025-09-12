@@ -3,19 +3,19 @@
 
 import re
 import torch
+from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
-from torch.utils.data import DataLoader
 
-# --- Patterns numériques ---
+# Extraction numérique robuste
 RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
 
 def clean_answer(ans: str) -> str:
     """
-    Label 'propre' pour le RL :
-    - Priorité au nombre après '####'
-    - Sinon dernier nombre trouvé dans le texte
-    - Sinon ans.strip()
+    Label "propre" pour le RL :
+      - priorise le nombre après '####'
+      - sinon prend le DERNIER nombre dans le texte
+      - sinon renvoie ans.strip()
     """
     if not ans:
         return ""
@@ -27,6 +27,7 @@ def clean_answer(ans: str) -> str:
         return nums[-1].group(0)
     return ans.strip()
 
+# Prompt concis avec format imposé
 INSTR = (
     "You are a helpful math tutor. Solve the problem.\n"
     "Output ONLY the final numeric answer prefixed by '#### ' and nothing else.\n"
@@ -40,8 +41,8 @@ def get_dataloaders(
     max_input_tokens: int = 768,
 ):
     """
-    Charge GSM8K (train), prépare des paires (prompt, answer_clean).
-    On force la génération en commençant par '#### ' pour garantir un nombre.
+    Charge GSM8K (train), formate des paires (prompt, answer_clean).
+    On force la génération en terminant le prompt par '#### ' pour obtenir directement un nombre.
     """
     ds = load_dataset("gsm8k", "main")
     train = ds["train"].shuffle(seed=42).select(range(min(num_samples, len(ds["train"]))))
@@ -50,12 +51,12 @@ def get_dataloaders(
     for ex in train:
         q = ex["question"]
         a_clean = clean_answer(ex["answer"])
-        # ❗ Prompt court + contrainte de format et préfixe '#### '
+        # Prompt + préfixe '#### ' pour forcer le format
         prompt = f"{INSTR}\nQ: {q}\nA:\n#### "
         prompts.append(prompt)
         answers.append(a_clean)
 
-    class RLDS(torch.utils.data.Dataset):
+    class RLDS(Dataset):
         def __init__(self, prompts, answers):
             self.prompts = prompts
             self.answers = answers
