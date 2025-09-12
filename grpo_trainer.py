@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 # GRPO Trainer robuste :
-# - Découpe du suffixe généré au bon offset partagé (len(input_ids))
-# - LogitsProcessor: boost des tokens de digits en début de suffixe (soft constraint)
-# - Reward shaping progressif (+ filet 0.05 si un nombre apparaît quelque part)
-# - PPO clip + KL (ref gelé) + entropie faible
-# - clamp/nan_to_num, greedy par défaut, fallback greedy
-# - Logs TB + debug premier batch
+# - Découpe suffixe au bon offset partagé (len(input_ids))
+# - LogitsProcessor: boost des digits sur 1ers pas du suffixe
+# - bad_words_ids: interdit "Q:" / "A:" au début du suffixe
+# - do_sample + min_new_tokens=2 pour éviter suffixe vide
+# - Reward shaping progressif + filet 0.05 si nb n'importe où
+# - PPO clip + KL (ref gelé) + entropie basse
+# - clamp/nan_to_num, fallback greedy, logs TB + debug batch 0
 
 import os
 import copy
@@ -20,11 +21,11 @@ from torch.optim import AdamW
 from transformers import get_scheduler
 from transformers.generation.logits_process import LogitsProcessorList, LogitsProcessor
 
-# Nombre AU DÉBUT du suffixe (ce que le modèle doit écrire)
-RE_BEGIN_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
-# Nombre attendu dans le label (on prend le '#### n' prioritairement)
-RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
-RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
+# === Regex util ===
+RE_BEGIN_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")       # nombre AU DÉBUT du suffixe
+RE_HASH      = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")    # nombre label "#### n"
+RE_ANY       = re.compile(r"-?\d+(?:\.\d+)?")             # n'importe quel nombre
+
 
 def extract_label_number(text: str) -> float | None:
     if not text:
@@ -43,8 +44,8 @@ def extract_label_number(text: str) -> float | None:
             return None
     return None
 
+
 def extract_pred_number_from_suffix_head(suffix: str) -> float | None:
-    """Prend UNIQUEMENT le nombre au début du suffixe généré."""
     if not suffix:
         return None
     m = RE_BEGIN_NUM.match(suffix.strip())
@@ -57,34 +58,36 @@ def extract_pred_number_from_suffix_head(suffix: str) -> float | None:
 
 
 class DigitPrefixBoost(LogitsProcessor):
-    """
-    Ajoute un biais positif aux ids des digits (0-9, '.' et '-') pendant les
-    premiers pas de génération (longueur suffixe <= max_prefix_len).
-    Objectif : pousser le modèle à commencer par un nombre.
-    """
-    def __init__(self, tokenizer, base_len: int, boost: float = 5.0, max_prefix_len: int = 6):
+    """Biaise les ids {0-9, '.', '-'} pendant les 1ers pas du suffixe."""
+    def __init__(self, tokenizer, base_len: int, boost: float = 5.0, max_prefix_len: int = 8):
         self.base_len = base_len
         self.max_prefix_len = max_prefix_len
         self.boost = boost
-
-        # Construire l’ensemble des ids autorisés pour chiffres / signe / point
         allowed_chars = list("0123456789") + ['.', '-']
         allowed_ids = set()
         for ch in allowed_chars:
             ids = tokenizer.encode(ch, add_special_tokens=False)
             if len(ids) == 1:
                 allowed_ids.add(ids[0])
-        # Dans certains BPE, '.' peut être multi-tokens : on ignore si >1
-        self.allowed_ids = list(allowed_ids) if allowed_ids else []
+        self.allowed_ids = list(allowed_ids)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        # input_ids shape: [B, cur_len]
         cur_len = input_ids.shape[1]
         gen_len = max(0, cur_len - self.base_len)
         if self.allowed_ids and gen_len < self.max_prefix_len:
-            # Boost sur les ids numériques
             scores[:, self.allowed_ids] = scores[:, self.allowed_ids] + self.boost
         return scores
+
+
+def build_bad_words_ids(tokenizer):
+    """Interdit uniquement les séquences 'Q:' et 'A:' (en débuts de tokens), pas la lettre 'Q' en général."""
+    bad_phrases = ["Q:", "A:", "\nQ:", "\nA:", "Question:", "Answer:"]
+    bad = []
+    for s in bad_phrases:
+        ids = tokenizer.encode(s, add_special_tokens=False)
+        if ids:
+            bad.append(ids)
+    return bad
 
 
 class GRPOConfig:
@@ -101,10 +104,10 @@ class GRPOConfig:
         entropy_coef=0.001,
         normalize_rewards=True,
         save_steps=50,
-        do_sample=False,         # greedy par défaut (Kaggle)
+        do_sample=True,          # ✅ on échantillonne pour avoir des chiffres
         temperature=0.7,
-        top_k=50,
-        top_p=0.95,
+        top_k=40,
+        top_p=0.9,
         enable_greedy_fallback=True,
         debug_print_first_batch=True,
     ):
@@ -135,7 +138,7 @@ class GRPOTrainerWrapper:
         output_dir="outputs/grpo-granite",
         max_steps=100,
         temperature=0.7,
-        new_tokens=16,   # court : on attend juste quelques chiffres
+        new_tokens=16,
         writer: SummaryWriter = None,
         config: GRPOConfig = None,
     ):
@@ -148,7 +151,7 @@ class GRPOTrainerWrapper:
         self.global_step = 0
         self.config = config or GRPOConfig(temperature=temperature)
 
-        # Modèle de référence gelé pour KL
+        # Modèle de ref gelé pour KL
         self.ref_model = copy.deepcopy(model).eval()
         for p in self.ref_model.parameters():
             p.requires_grad = False
@@ -165,6 +168,9 @@ class GRPOTrainerWrapper:
             num_warmup_steps=self.config.warmup_steps,
             num_training_steps=max(self.max_steps, 1),
         )
+
+        # Prépare bad_words_ids pour bannir "Q:" / "A:"
+        self.bad_words_ids = build_bad_words_ids(self.tokenizer)
 
     @staticmethod
     def _std_safe(x: torch.Tensor) -> float:
@@ -196,29 +202,30 @@ class GRPOTrainerWrapper:
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
 
     def _generate(self, base_len: int, **inputs):
-        # Logits processor: boost des digits sur les premiers pas
-        lp = LogitsProcessorList([DigitPrefixBoost(self.tokenizer, base_len=base_len, boost=5.0, max_prefix_len=6)])
+        lp = LogitsProcessorList([DigitPrefixBoost(self.tokenizer, base_len=base_len, boost=5.0, max_prefix_len=8)])
         try:
             if self.config.do_sample:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
-                    min_new_tokens=1,
+                    min_new_tokens=2,                       # ✅ évite suffixe vide
                     do_sample=True,
                     temperature=max(self.config.temperature, 1e-5),
                     top_k=self.config.top_k,
                     top_p=self.config.top_p,
                     pad_token_id=self.tokenizer.eos_token_id,
                     logits_processor=lp,
+                    bad_words_ids=self.bad_words_ids or None,  # ✅ bannit "Q:"/ "A:"
                 )
             else:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
-                    min_new_tokens=1,
+                    min_new_tokens=2,
                     do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
                     logits_processor=lp,
+                    bad_words_ids=self.bad_words_ids or None,
                 )
         except Exception as e:
             print(f"⚠️ Sampling a échoué ({e}). Fallback greedy.")
@@ -229,24 +236,19 @@ class GRPOTrainerWrapper:
             return self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
-                min_new_tokens=1,
+                min_new_tokens=2,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
                 logits_processor=lp,
+                bad_words_ids=self.bad_words_ids or None,
             )
 
     # ===== Reward shaping progressif =====
     def _reward(self, suffix: str, gold_str: str) -> float:
         """
-        Échelle progressive :
-        - 1.00 : exact
-        - 0.80 : erreur relative < 1e-3
-        - 0.60 : min(err_abs < 1, err_rel < 1%)
-        - 0.40 : err_rel < 10%
-        - 0.20 : err_rel < 20%
-        - 0.10 : un nombre au début du suffixe
-        - 0.05 : sinon, s'il y a un nombre quelque part dans le suffixe
-        - 0.00 : aucun nombre détecté
+        1.00 exact ; 0.80 err_rel<1e-3 ; 0.60 err_abs<1 ou err_rel<1% ;
+        0.40 err_rel<10% ; 0.20 err_rel<20% ; 0.10 nombre en tête ;
+        0.05 nombre quelque part ; 0.00 sinon.
         """
         head = extract_pred_number_from_suffix_head(suffix)
         gold = extract_label_number(gold_str)
@@ -255,7 +257,6 @@ class GRPOTrainerWrapper:
             err_abs = abs(head - gold)
             base = max(1.0, abs(gold))
             err_rel = err_abs / base
-
             if err_abs == 0:
                 return 1.0
             if err_rel < 1e-3:
@@ -266,12 +267,11 @@ class GRPOTrainerWrapper:
                 return 0.4
             if err_rel < 0.20:
                 return 0.2
-            return 0.1  # head présent mais loin
-
-        if head is not None:  # head présent mais pas de gold propre
             return 0.1
 
-        # filet anti "tout zéro" si un nombre apparaît quelque part
+        if head is not None:
+            return 0.1
+
         if RE_ANY.search(suffix or ""):
             return 0.05
 
@@ -289,24 +289,19 @@ class GRPOTrainerWrapper:
             golds = batch["answers"]
 
             # Tokenize prompts
-            inputs = self.tokenizer(
-                prompts, return_tensors="pt", padding=True, truncation=True
-            ).to(device)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
-            # ✅ longueur PARTAGÉE des entrées (inclut padding)
+            # ✅ longueur PARTAGÉE des entrées
             shared_in_len = inputs["input_ids"].shape[1]
 
-            # Génération avec biais digit en début de suffixe
+            # Génération (digits boost + bad_words)
             with torch.no_grad():
                 outputs = self._generate(shared_in_len, **inputs)  # [B, shared_in_len + new]
 
-            # Suffixe = tokens après shared_in_len pour chaque item
+            # Suffixes = tokens après shared_in_len
             suffixes = []
             for i in range(outputs.size(0)):
-                if outputs.size(1) <= shared_in_len:
-                    suf_ids = outputs[i, 0:0]  # vide
-                else:
-                    suf_ids = outputs[i, shared_in_len:]
+                suf_ids = outputs[i, shared_in_len:] if outputs.size(1) > shared_in_len else outputs[i, 0:0]
                 suffixes.append(self.tokenizer.decode(suf_ids, skip_special_tokens=True))
 
             # Rewards
@@ -317,7 +312,7 @@ class GRPOTrainerWrapper:
             # Debug batch 0
             if self.config.debug_print_first_batch and step == 0:
                 print("=== DEBUG batch 0 ===")
-                for i in range(min(2, len(prompts))):
+                for i in range(min(3, len(prompts))):
                     print("SUFFIX GENERATED ↓")
                     print(suffixes[i][:200].replace("\n", "\\n"))
                     print("LABEL =", golds[i])
