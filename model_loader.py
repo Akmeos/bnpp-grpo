@@ -1,82 +1,81 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from typing import Tuple, Iterable
+
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, TaskType
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, get_peft_model
+import re
 
-def _set_trainable_params(
-    model: torch.nn.Module,
-    train_router: bool = True,
-    freeze_experts: bool = True,
-    router_keywords: Iterable[str] = ("router", "gate"),
-    experts_keyword: str = "experts",
-):
-    for name, p in model.named_parameters():
-        # par défaut, on gèle tout (les LoRA injectées seront entraînables)
-        p.requires_grad = False
+MODEL_NAME = "ibm-granite/granite-3.1-1b-a400m-instruct"
 
-    if freeze_experts:
-        for name, p in model.named_parameters():
-            if experts_keyword in name:
-                p.requires_grad = False  # explicit, pour clarté
+def set_trainable_attention_and_router(model):
+    """
+    Gèle tous les paramètres sauf :
+    - Projections Q/K/V/O de l'attention
+    - Router/gating des experts
+    """
+    n_trainable, n_frozen = 0, 0
 
-    if train_router:
-        for name, p in model.named_parameters():
-            if any(k in name for k in router_keywords):
-                p.requires_grad = True
+    # Tout geler
+    for name, param in model.named_parameters():
+        param.requires_grad = False
+        n_frozen += param.numel()
 
-def load_model_and_tokenizer(
-    model_name: str,
-    trust_remote_code: bool,
-    use_gpu: bool,
-    prefer_mps: bool = False,
-    lora_target_modules: Iterable[str] = ("q_proj", "k_proj", "v_proj", "o_proj"),
-    lora_r: int = 8,
-    lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    freeze_experts: bool = True,
-    train_router: bool = True,
-) -> Tuple[torch.nn.Module, AutoTokenizer]:
-    device = "cuda" if (use_gpu and torch.cuda.is_available()) else "cpu"
+    # Définir les patterns
+    patterns = [
+        r"\b(attn|attention)\.(q_proj|k_proj|v_proj|o_proj)\b",
+        r"\b(router|gating|gate)\b",
+    ]
 
-    # dtype auto -> fp16/bf16 si possible, sinon float32
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    def is_target(name):
+        return any(re.search(pat, name) for pat in patterns)
 
-    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    # Dé-geler attention + router
+    for name, param in model.named_parameters():
+        if is_target(name):
+            param.requires_grad = True
+            n_trainable += param.numel()
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        trust_remote_code=trust_remote_code,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-        device_map="auto" if device == "cuda" else None,
+    print(f"[Paramètres] Trainables : {n_trainable:,} | Figés : {n_frozen - n_trainable:,}")
+    print("Exemples de paramètres actifs :")
+    for name, p in list((n, p) for n, p in model.named_parameters() if p.requires_grad)[:20]:
+        print("  +", name)
+
+    return model
+
+def load_model_with_lora():
+    """
+    Charge Granite 1.3B (MoE), applique LoRA sur attention et gèle les experts.
+    """
+    print(f"Chargement du modèle {MODEL_NAME} ...")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float16,
+        device_map="auto"
     )
 
-    # (optionnel) checkpointing pour gratter de la VRAM sur GPU
-    try:
-        base_model.gradient_checkpointing_enable()
-    except Exception:
-        pass
-
+    # Appliquer LoRA sur l'attention
     lora_cfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
-        target_modules=list(lora_target_modules),
-        bias="none",
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # attention uniquement
+        task_type="CAUSAL_LM"
     )
-    model = get_peft_model(base_model, lora_cfg)
+    model = get_peft_model(model, lora_cfg)
 
-    # Router entraîné + experts gelés
-    _set_trainable_params(model, train_router=train_router, freeze_experts=freeze_experts)
+    # Forcer seulement attention + router comme trainables
+    model = set_trainable_attention_and_router(model)
 
-    # déplacer sur CPU explicite si pas de CUDA
-    if device == "cpu":
-        model.to("cpu")
+    model.print_trainable_parameters()
+    return model
 
-    return model, tok
+def load_tokenizer():
+    """
+    Charge le tokenizer de Granite.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
