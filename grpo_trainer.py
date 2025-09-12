@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 
 # GRPO Trainer robuste :
-# - Découpe du suffixe généré PAR-ÉLÉMENT (via attention_mask.sum)
-# - Extraction stricte du nombre au début du suffixe
-# - Reward shaping progressif (format -> proximité -> exact)
+# - Découpe du suffixe généré au bon offset partagé (len(input_ids))
+# - Extraction stricte du nombre en début de suffixe
+# - Reward shaping progressif (+ filet 0.05 si un nombre apparaît quelque part)
 # - Skip update si reward==0 partout
 # - PPO clip + KL (ref gelé) + entropie faible
 # - clamp/nan_to_num, greedy par défaut, fallback greedy
@@ -43,7 +43,7 @@ def extract_label_number(text: str) -> float | None:
             return None
     return None
 
-def extract_pred_number_from_suffix(suffix: str) -> float | None:
+def extract_pred_number_from_suffix_head(suffix: str) -> float | None:
     """Prend UNIQUEMENT le nombre au début du suffixe généré."""
     if not suffix:
         return None
@@ -197,7 +197,7 @@ class GRPOTrainerWrapper:
             )
 
     # ===== Reward shaping progressif =====
-    def _reward(self, pred: float | None, gold: float | None) -> float:
+    def _reward(self, suffix: str, gold_str: str) -> float:
         """
         Échelle progressive :
         - 1.00 : exact
@@ -205,29 +205,38 @@ class GRPOTrainerWrapper:
         - 0.60 : min(err_abs < 1, err_rel < 1%)
         - 0.40 : err_rel < 10%
         - 0.20 : err_rel < 20%
-        - 0.10 : un nombre est présent (pred non None)
-        - 0.00 : sinon
+        - 0.10 : un nombre au début du suffixe
+        - 0.05 : sinon, s'il y a un nombre quelque part dans le suffixe
+        - 0.00 : aucun nombre détecté
         """
-        if pred is None:
-            return 0.0
-        if gold is None:
+        head = extract_pred_number_from_suffix_head(suffix)
+        gold = extract_label_number(gold_str)
+
+        if head is not None and gold is not None:
+            err_abs = abs(head - gold)
+            base = max(1.0, abs(gold))
+            err_rel = err_abs / base
+
+            if err_abs == 0:
+                return 1.0
+            if err_rel < 1e-3:
+                return 0.8
+            if err_abs < 1.0 or err_rel < 0.01:
+                return 0.6
+            if err_rel < 0.10:
+                return 0.4
+            if err_rel < 0.20:
+                return 0.2
+            return 0.1  # head présent mais loin
+
+        if head is not None:  # head présent mais pas de gold propre
             return 0.1
 
-        err_abs = abs(pred - gold)
-        base = max(1.0, abs(gold))
-        err_rel = err_abs / base
+        # filet anti "tout zéro" si un nombre apparaît quelque part
+        if RE_ANY.search(suffix or ""):
+            return 0.05
 
-        if err_abs == 0:
-            return 1.0
-        if err_rel < 1e-3:
-            return 0.8
-        if err_abs < 1.0 or err_rel < 0.01:
-            return 0.6
-        if err_rel < 0.10:
-            return 0.4
-        if err_rel < 0.20:
-            return 0.2
-        return 0.1
+        return 0.0
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -240,35 +249,29 @@ class GRPOTrainerWrapper:
             prompts = batch["prompts"]
             golds = batch["answers"]
 
-            # Tokenize prompts (padding side LEFT dans model_loader)
+            # Tokenize prompts
             inputs = self.tokenizer(
                 prompts, return_tensors="pt", padding=True, truncation=True
             ).to(device)
 
-            # Longueur réelle du prompt pour chaque élément
-            attn = inputs["attention_mask"]
-            prompt_lens = attn.sum(dim=1).tolist()
+            # ✅ longueur PARTAGÉE des entrées (inclut le padding)
+            shared_in_len = inputs["input_ids"].shape[1]
 
             # Génération
             with torch.no_grad():
-                outputs = self._generate(**inputs)
+                outputs = self._generate(**inputs)  # [B, shared_in_len + new]
 
-            # Suffixe généré PAR-ÉLÉMENT
+            # Suffixe = tokens après shared_in_len pour chaque item
             suffixes = []
             for i in range(outputs.size(0)):
-                pl = int(prompt_lens[i])
-                # clamp au cas où
-                pl = max(0, min(pl, outputs.size(1)))
-                gen_ids_i = outputs[i, pl:]
-                suffixes.append(self.tokenizer.decode(gen_ids_i, skip_special_tokens=True))
+                if outputs.size(1) <= shared_in_len:
+                    suf_ids = outputs[i, 0:0]  # vide
+                else:
+                    suf_ids = outputs[i, shared_in_len:]
+                suffixes.append(self.tokenizer.decode(suf_ids, skip_special_tokens=True))
 
             # Rewards
-            rewards_list = []
-            for suf, gold in zip(suffixes, golds):
-                pred_num = extract_pred_number_from_suffix(suf)
-                gold_num = extract_label_number(gold)
-                rewards_list.append(self._reward(pred_num, gold_num))
-
+            rewards_list = [self._reward(suf, gold) for suf, gold in zip(suffixes, golds)]
             rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
             rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
 
