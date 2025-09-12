@@ -21,6 +21,7 @@ def load_model_and_tokenizer(model_name: str = "ibm-granite/granite-3.1-1b-a400m
     # Évite erreurs de padding à la génération
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
 
     # --- Modèle ---
     model = AutoModelForCausalLM.from_pretrained(

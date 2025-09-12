@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 
 # GRPO Trainer robuste :
-# - Décodage du SEUL suffixe généré (pas le prompt)
-# - Extraction stricte du nombre en début de suffixe
-# - Reward = 1/0.8/0.5/0 uniquement sur ce nombre
+# - Découpe du suffixe généré PAR-ÉLÉMENT (via attention_mask.sum)
+# - Extraction stricte du nombre au début du suffixe
+# - Reward shaping progressif (format -> proximité -> exact)
 # - Skip update si reward==0 partout
-# - PPO clip + KL (ref gelé) + entropy faible
-# - clamp/nan_to_num
-# - Greedy par défaut (Kaggle/T4), fallback greedy si sampling échoue
-# - Logs TB + debug batch 0
+# - PPO clip + KL (ref gelé) + entropie faible
+# - clamp/nan_to_num, greedy par défaut, fallback greedy
+# - Logs TB + debug premier batch
 
 import os
 import copy
@@ -23,8 +22,7 @@ from transformers import get_scheduler
 
 # Nombre AU DÉBUT du suffixe (ce que le modèle doit écrire)
 RE_BEGIN_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
-
-# Nombre attendu dans le label (on prend le dernier '#### n' ou dernier nombre si besoin)
+# Nombre attendu dans le label (on prend le '#### n' prioritairement)
 RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
 
@@ -198,23 +196,38 @@ class GRPOTrainerWrapper:
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-    def _reward(self, suffix: str, gold_str: str) -> float:
+    # ===== Reward shaping progressif =====
+    def _reward(self, pred: float | None, gold: float | None) -> float:
         """
-        Reward stricte basée sur le NOMBRE AU DÉBUT DU SUFFIXE.
-        1.0 si exact, 0.8 si |diff|<1e-3, 0.5 si |diff|<1.0, sinon 0.
+        Échelle progressive :
+        - 1.00 : exact
+        - 0.80 : erreur relative < 1e-3
+        - 0.60 : min(err_abs < 1, err_rel < 1%)
+        - 0.40 : err_rel < 10%
+        - 0.20 : err_rel < 20%
+        - 0.10 : un nombre est présent (pred non None)
+        - 0.00 : sinon
         """
-        pred = extract_pred_number_from_suffix(suffix)
-        gold = extract_label_number(gold_str)
-        if pred is None or gold is None:
+        if pred is None:
             return 0.0
-        diff = abs(pred - gold)
-        if diff == 0:
+        if gold is None:
+            return 0.1
+
+        err_abs = abs(pred - gold)
+        base = max(1.0, abs(gold))
+        err_rel = err_abs / base
+
+        if err_abs == 0:
             return 1.0
-        if diff < 1e-3:
+        if err_rel < 1e-3:
             return 0.8
-        if diff < 1.0:
-            return 0.5
-        return 0.0
+        if err_abs < 1.0 or err_rel < 0.01:
+            return 0.6
+        if err_rel < 0.10:
+            return 0.4
+        if err_rel < 0.20:
+            return 0.2
+        return 0.1
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -227,24 +240,39 @@ class GRPOTrainerWrapper:
             prompts = batch["prompts"]
             golds = batch["answers"]
 
-            # Tokenize prompts
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
-            prompt_len = inputs["input_ids"].shape[1]
+            # Tokenize prompts (padding side LEFT dans model_loader)
+            inputs = self.tokenizer(
+                prompts, return_tensors="pt", padding=True, truncation=True
+            ).to(device)
+
+            # Longueur réelle du prompt pour chaque élément
+            attn = inputs["attention_mask"]
+            prompt_lens = attn.sum(dim=1).tolist()
 
             # Génération
             with torch.no_grad():
                 outputs = self._generate(**inputs)
 
-            # ❗ On ne garde QUE le suffixe généré
-            gen_ids = outputs[:, prompt_len:]
-            suffixes = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            # Suffixe généré PAR-ÉLÉMENT
+            suffixes = []
+            for i in range(outputs.size(0)):
+                pl = int(prompt_lens[i])
+                # clamp au cas où
+                pl = max(0, min(pl, outputs.size(1)))
+                gen_ids_i = outputs[i, pl:]
+                suffixes.append(self.tokenizer.decode(gen_ids_i, skip_special_tokens=True))
 
-            # Rewards (strictes)
-            rewards_list = [self._reward(suf, gold) for suf, gold in zip(suffixes, golds)]
+            # Rewards
+            rewards_list = []
+            for suf, gold in zip(suffixes, golds):
+                pred_num = extract_pred_number_from_suffix(suf)
+                gold_num = extract_label_number(gold)
+                rewards_list.append(self._reward(pred_num, gold_num))
+
             rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
             rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
 
-            # Debug premier batch
+            # Debug batch 0
             if self.config.debug_print_first_batch and step == 0:
                 print("=== DEBUG batch 0 ===")
                 for i in range(min(2, len(prompts))):
@@ -292,7 +320,6 @@ class GRPOTrainerWrapper:
 
             # KL + Entropie
             kl_loss = self.kl_penalty(gen_logprobs, ref_logprobs)
-            # Entropie du dernier pas (sur suffixes)
             entropy = -(logprobs[:, -1, :].exp() * logprobs[:, -1, :]).sum(-1).mean()
             entropy_bonus = -self.config.entropy_coef * entropy
             loss = policy_loss + kl_loss + entropy_bonus
