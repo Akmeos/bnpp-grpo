@@ -37,7 +37,7 @@ class GRPOConfig:
         entropy_coef=0.01,
         normalize_rewards=True,
         save_steps=50,
-        do_sample=True,
+        do_sample=False,
         temperature=0.7,
         top_k=50,
         top_p=0.95,
@@ -133,27 +133,39 @@ class GRPOTrainerWrapper:
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
 
     def _generate(self, **inputs):
+        """Génération robuste: sampling par défaut, fallback greedy sur ANY error."""
         try:
-            return self.model.generate(
-                **inputs,
-                max_new_tokens=self.new_tokens,
-                do_sample=self.config.do_sample,
-                temperature=self.config.temperature,
-                top_k=self.config.top_k,
-                top_p=self.config.top_p,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-        except RuntimeError as e:
-            if "multinomial" in str(e) and self.config.enable_greedy_fallback:
-                print("⚠️ Sampling a échoué. Fallback greedy.")
-                torch.cuda.empty_cache()
+            if self.config.do_sample:
+                return self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.new_tokens,
+                    do_sample=True,
+                    temperature=max(self.config.temperature, 1e-5),
+                    top_k=self.config.top_k,
+                    top_p=self.config.top_p,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+            else:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
                     do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
-            raise
+        except Exception as e:
+            # Peu importe le message (y compris "device-side assert"), on bascule en greedy
+            print(f"⚠️ Sampling a échoué ({e}). Fallback greedy do_sample=False.")
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return self.model.generate(
+                **inputs,
+                max_new_tokens=self.new_tokens,
+                do_sample=False,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
 
     # --------- training ---------
 
