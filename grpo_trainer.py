@@ -189,7 +189,7 @@ class GRPOTrainerWrapper:
             batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
             logits = self.model(**batch_outputs).logits.float()
             logprobs = F.log_softmax(logits, dim=-1)
-            logprobs = torch.clamp(logprobs, min=-20, max=0)
+            logprobs = torch.clamp(logprobs, min=-20, max=0)  # ✅ clamp pour éviter -inf/+nan
             gen_logprobs = logprobs[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
