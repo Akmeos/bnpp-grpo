@@ -75,7 +75,7 @@ def main():
         entropy_coef=0.001,     # entropie faible
         normalize_rewards=True,
         save_steps=50,
-        do_sample=False,        # greedy => évite erreurs multinomial CUDA
+        do_sample=True,        # greedy => évite erreurs multinomial CUDA
         temperature=args.temperature,
     )
 

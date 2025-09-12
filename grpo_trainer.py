@@ -202,30 +202,88 @@ class GRPOTrainerWrapper:
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
 
     def _generate(self, base_len: int, **inputs):
-        lp = LogitsProcessorList([DigitPrefixBoost(self.tokenizer, base_len=base_len, boost=5.0, max_prefix_len=8)])
+        # Forcer la génération à commencer par "####"
+        forced_prefix = "#### "
+        forced_prefix_ids = self.tokenizer.encode(forced_prefix, add_special_tokens=False)
+        print(f"Forced prefix '{forced_prefix}' -> token IDs: {forced_prefix_ids}")
+        
+        # Créer un processeur pour forcer le préfixe
+        class ForcePrefixProcessor(LogitsProcessor):
+            def __init__(self, tokenizer, base_len, forced_prefix_ids):
+                self.tokenizer = tokenizer
+                self.base_len = base_len
+                self.forced_prefix_ids = forced_prefix_ids
+            
+            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+                cur_len = input_ids.shape[1]
+                gen_step = cur_len - self.base_len
+                
+                # Forcer les premiers tokens à correspondre à "#### "
+                if 0 <= gen_step < len(self.forced_prefix_ids):
+                    forced_token_id = self.forced_prefix_ids[gen_step]
+                    # Mettre tous les scores à -inf sauf le token forcé
+                    scores[:, :] = -float('inf')
+                    scores[:, forced_token_id] = 0
+                
+                return scores
+        
+        # Processeur pour booster les digits après le préfixe
+        class DigitAfterPrefixBoost(LogitsProcessor):
+            def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 15.0):
+                self.tokenizer = tokenizer
+                self.base_len = base_len
+                self.forced_prefix_len = len(forced_prefix_ids)
+                self.boost = boost
+                # Tokens autorisés: chiffres, point, signe moins
+                digit_chars = list("0123456789") + ['.', '-']
+                self.allowed_ids = set()
+                for ch in digit_chars:
+                    ids = tokenizer.encode(ch, add_special_tokens=False)
+                    if len(ids) == 1:
+                        self.allowed_ids.add(ids[0])
+                self.allowed_ids = list(self.allowed_ids)
+        
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+            cur_len = input_ids.shape[1]
+            gen_step = cur_len - self.base_len
+            
+            # Appliquer le boost seulement après le préfixe "#### "
+            if gen_step >= self.forced_prefix_len and self.allowed_ids:
+                scores[:, self.allowed_ids] = scores[:, self.allowed_ids] + self.boost
+            
+            return scores
+    
+        # Combiner les processeurs
+        lp = LogitsProcessorList([
+            ForcePrefixProcessor(self.tokenizer, base_len, forced_prefix_ids),
+            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=10.0)
+        ])
+        
         try:
             if self.config.do_sample:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
-                    min_new_tokens=2,                       # ✅ évite suffixe vide
+                    min_new_tokens=6,  # Au moins "#### " + 1 chiffre
                     do_sample=True,
                     temperature=max(self.config.temperature, 1e-5),
                     top_k=self.config.top_k,
                     top_p=self.config.top_p,
                     pad_token_id=self.tokenizer.eos_token_id,
                     logits_processor=lp,
-                    bad_words_ids=self.bad_words_ids or None,  # ✅ bannit "Q:"/ "A:"
+                    bad_words_ids=self.bad_words_ids or None,
+                    repetition_penalty=1.1,  # Éviter la répétition
                 )
             else:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
-                    min_new_tokens=2,
+                    min_new_tokens=6,
                     do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
                     logits_processor=lp,
                     bad_words_ids=self.bad_words_ids or None,
+                    repetition_penalty=1.1,
                 )
         except Exception as e:
             print(f"⚠️ Sampling a échoué ({e}). Fallback greedy.")
@@ -236,46 +294,45 @@ class GRPOTrainerWrapper:
             return self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
-                min_new_tokens=2,
+                min_new_tokens=6,
                 do_sample=False,
                 pad_token_id=self.tokenizer.eos_token_id,
                 logits_processor=lp,
                 bad_words_ids=self.bad_words_ids or None,
+                repetition_penalty=1.1,
             )
 
     # ===== Reward shaping progressif =====
     def _reward(self, suffix: str, gold_str: str) -> float:
         """
-        1.00 exact ; 0.80 err_rel<1e-3 ; 0.60 err_abs<1 ou err_rel<1% ;
-        0.40 err_rel<10% ; 0.20 err_rel<20% ; 0.10 nombre en tête ;
-        0.05 nombre quelque part ; 0.00 sinon.
+        Récompense basée sur le format STRICT "#### nombre" + exactitude
         """
-        head = extract_pred_number_from_suffix_head(suffix)
-        gold = extract_label_number(gold_str)
-
-        if head is not None and gold is not None:
-            err_abs = abs(head - gold)
-            base = max(1.0, abs(gold))
-            err_rel = err_abs / base
-            if err_abs == 0:
-                return 1.0
-            if err_rel < 1e-3:
+        # Vérifie d'abord si le suffixe commence par "####"
+        if not suffix.strip().startswith("####"):
+            return 0.0  # Format incorrect = 0 récompense
+        
+        # Extrait le nombre après "####"
+        m = RE_BEGIN_NUM.match(suffix.replace("####", "").strip())
+        if not m:
+            return 0.0  # Pas de nombre après "####" = 0 récompense
+        
+        try:
+            pred = float(m.group(1))
+            gold = extract_label_number(gold_str)
+            
+            if gold is None:
+                return 0.0
+                
+            if pred == gold:
+                return 1.0  # Exact
+            elif abs(pred - gold) < 0.01:  # Tolérance pour les erreurs d'arrondi
                 return 0.8
-            if err_abs < 1.0 or err_rel < 0.01:
-                return 0.6
-            if err_rel < 0.10:
+            elif abs(pred - gold) / max(1.0, abs(gold)) < 0.1:
                 return 0.4
-            if err_rel < 0.20:
-                return 0.2
-            return 0.1
-
-        if head is not None:
-            return 0.1
-
-        if RE_ANY.search(suffix or ""):
-            return 0.05
-
-        return 0.0
+            else:
+                return 0.1  # Mauvais nombre mais bon format
+        except:
+            return 0.0
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -386,6 +443,12 @@ class GRPOTrainerWrapper:
                     f"clip_ratio_mean={float(ratio.mean().item()):.3f} "
                     f"entropy={float(entropy.item()):.3f}"
                 )
+                
+            if step % 5 == 0:
+                print(f"Prompt: {prompts[0][-100:]}...")  # Afficher la fin du prompt
+                print(f"Suffix: '{suffixes[0]}'")
+                print(f"Gold: {golds[0]}")
+                print(f"Reward: {rewards_list[0]}")
 
             if step > 0 and step % self.config.save_steps == 0:
                 self._save_checkpoint(step)

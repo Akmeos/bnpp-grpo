@@ -30,7 +30,9 @@ def clean_answer(ans: str) -> str:
 # Prompt concis avec format imposé
 INSTR = (
     "You are a helpful math tutor. Solve the problem.\n"
-    "Output ONLY the final numeric answer prefixed by '#### ' and nothing else.\n"
+    "Output ONLY the final numeric answer in the exact format: '#### number'\n"
+    "Example: If the answer is 42, output: #### 42\n"
+    "Do not output any other text, explanations, or formatting.\n"
 )
 
 def get_dataloaders(
