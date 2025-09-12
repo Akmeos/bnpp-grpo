@@ -2,17 +2,21 @@
 # -*- coding: utf-8 -*-
 
 # Implémentation GRPO (Grouped Reinforcement Policy Optimization)
-# avec normalisation reward, clipping PPO, KL control, entropie
+# avec :
+# - Normalisation rewards robuste
+# - PPO clipping
+# - KL control avec modèle de référence gelé
+# - Entropy bonus
+# - Checkpoints périodiques
 
 import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import get_scheduler
 from torch.utils.tensorboard import SummaryWriter
-from typing import Dict, Any
 from torch.optim import AdamW
-
+from transformers import get_scheduler
+import copy
 
 
 # ============ CONFIG ============
@@ -30,7 +34,7 @@ class GRPOConfig:
         kl_target=None,           # seuil cible (optionnel pour early stop)
         entropy_coef=0.01,        # bonus entropie
         normalize_rewards=True,   # normalisation reward par batch
-        save_steps=50,            # ✅ fréquence de sauvegarde des checkpoints
+        save_steps=50,            # fréquence de sauvegarde checkpoints
     ):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -71,6 +75,11 @@ class GRPOTrainerWrapper:
         self.global_step = 0
         self.config = config or GRPOConfig()
 
+        # Modèle de référence (figé pour le KL)
+        self.ref_model = copy.deepcopy(model).eval()
+        for p in self.ref_model.parameters():
+            p.requires_grad = False
+
         # Optimizer + Scheduler
         self.optimizer = AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
@@ -85,18 +94,21 @@ class GRPOTrainerWrapper:
         )
 
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Calcule les avantages centrés/rééchelonnés pour PPO"""
+        """Normalisation robuste des rewards"""
         if self.config.normalize_rewards:
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+            std = rewards.std()
+            if std < 1e-6:   # éviter NaN si variance nulle
+                return rewards - rewards.mean()
+            return (rewards - rewards.mean()) / (std + 1e-8)
         return rewards
 
     def kl_penalty(self, logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
-        """KL divergence entre la policy courante et une policy de référence"""
+        """KL divergence entre la policy courante et la référence"""
         kl = (logprobs - ref_logprobs).mean()
         return self.config.kl_coef * kl
 
     def _save_checkpoint(self, step: int):
-        """Sauvegarde périodique du modèle"""
+        """Sauvegarde périodique"""
         ckpt_path = os.path.join(self.output_dir, f"checkpoint-{step}")
         os.makedirs(ckpt_path, exist_ok=True)
         self.model.save_pretrained(ckpt_path)
@@ -114,7 +126,7 @@ class GRPOTrainerWrapper:
             prompts = batch["prompts"]
             answers = batch["answers"]
 
-            # --- Tokenize les prompts ---
+            # --- Tokenize prompts ---
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
             # --- Génération avec sampling ---
@@ -127,7 +139,7 @@ class GRPOTrainerWrapper:
                 )
             generations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # --- Reward fonction (math accuracy simplifiée) ---
+            # --- Reward (math accuracy simple) ---
             rewards = []
             for gen, ans in zip(generations, answers):
                 if ans and ans in gen:
@@ -139,18 +151,21 @@ class GRPOTrainerWrapper:
             # --- Normalisation / Avantages ---
             advantages = self.compute_advantages(rewards)
 
-            # --- Re-tokenize les generations pour logprobs ---
+            # --- Re-tokenize generations ---
             batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
+
             logits = self.model(**batch_outputs).logits
             logprobs = F.log_softmax(logits, dim=-1)
-
-            # Proxy: dernier token
             gen_logprobs = logprobs[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
-            # Dummy ref logprobs
-            ref_logprobs = gen_logprobs.detach()
+            # --- Ref logprobs (baseline gelée) ---
+            with torch.no_grad():
+                ref_logits = self.ref_model(**batch_outputs).logits
+            ref_logprobs = F.log_softmax(ref_logits, dim=-1)[:, -1, :].gather(
+                1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
+            ).squeeze()
 
             # --- PPO surrogate loss ---
             ratio = torch.exp(gen_logprobs - ref_logprobs)
