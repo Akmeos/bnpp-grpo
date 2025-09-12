@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Implémentation GRPO (Grouped Reinforcement Policy Optimization)
-# avec :
-# - Normalisation rewards robuste
-# - PPO clipping
-# - KL control avec modèle de référence gelé
-# - Entropy bonus
-# - Checkpoints périodiques
+# GRPO "serré": rewards normalisées robustes, PPO clip, KL control avec ref model,
+# entropy bonus, checkpoints périodiques, génération robuste (fallback greedy),
+# et calcul des logprobs en float32 pour éviter les NaN en fp16.
 
 import os
+import copy
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_scheduler
-import copy
 
-
-# ============ CONFIG ============
 
 class GRPOConfig:
     def __init__(
@@ -34,7 +30,14 @@ class GRPOConfig:
         kl_target=None,           # seuil cible (optionnel pour early stop)
         entropy_coef=0.01,        # bonus entropie
         normalize_rewards=True,   # normalisation reward par batch
-        save_steps=50,            # fréquence de sauvegarde checkpoints
+        save_steps=50,            # fréquence checkpoints
+        # sampling par défaut (plus stable que sampling "libre")
+        do_sample=True,
+        temperature=0.7,
+        top_k=50,
+        top_p=0.95,
+        # fallback si sampling casse (CUDA multinomial assert)
+        enable_greedy_fallback=True,
     ):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -47,9 +50,12 @@ class GRPOConfig:
         self.entropy_coef = entropy_coef
         self.normalize_rewards = normalize_rewards
         self.save_steps = save_steps
+        self.do_sample = do_sample
+        self.temperature = temperature
+        self.top_k = top_k
+        self.top_p = top_p
+        self.enable_greedy_fallback = enable_greedy_fallback
 
-
-# ============ TRAINER ============
 
 class GRPOTrainerWrapper:
     def __init__(
@@ -61,21 +67,21 @@ class GRPOTrainerWrapper:
         temperature=0.7,
         new_tokens=256,
         no_vllm=True,
-        writer: SummaryWriter = None,
-        config: GRPOConfig = None,
+        writer: Optional[SummaryWriter] = None,
+        config: Optional[GRPOConfig] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.output_dir = output_dir
         self.max_steps = max_steps
-        self.temperature = temperature
         self.new_tokens = new_tokens
         self.no_vllm = no_vllm
         self.writer = writer
         self.global_step = 0
-        self.config = config or GRPOConfig()
+        # si un temperature est passé par train.py, on surcouche la config
+        self.config = config or GRPOConfig(temperature=temperature)
 
-        # Modèle de référence (figé pour le KL)
+        # Modèle de référence (gelé) pour le KL
         self.ref_model = copy.deepcopy(model).eval()
         for p in self.ref_model.parameters():
             p.requires_grad = False
@@ -93,27 +99,61 @@ class GRPOTrainerWrapper:
             num_training_steps=max_steps,
         )
 
+    # --------- utilitaires ---------
+
+    @staticmethod
+    def _std_safe(x: torch.Tensor) -> float:
+        if x.numel() <= 1:
+            return 0.0
+        s = x.std()
+        return float(s.item()) if torch.isfinite(s) else 0.0
+
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         """Normalisation robuste des rewards"""
         if self.config.normalize_rewards:
+            if rewards.numel() <= 1:
+                return rewards - rewards.mean()
             std = rewards.std()
-            if std < 1e-6:   # éviter NaN si variance nulle
+            if not torch.isfinite(std) or std < 1e-6:
                 return rewards - rewards.mean()
             return (rewards - rewards.mean()) / (std + 1e-8)
         return rewards
 
     def kl_penalty(self, logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
-        """KL divergence entre la policy courante et la référence"""
+        """KL approx (diff de logprobs moyens)"""
         kl = (logprobs - ref_logprobs).mean()
         return self.config.kl_coef * kl
 
     def _save_checkpoint(self, step: int):
-        """Sauvegarde périodique"""
         ckpt_path = os.path.join(self.output_dir, f"checkpoint-{step}")
         os.makedirs(ckpt_path, exist_ok=True)
         self.model.save_pretrained(ckpt_path)
         self.tokenizer.save_pretrained(ckpt_path)
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
+
+    def _generate(self, **inputs):
+        """Génération robuste: sampling par défaut, fallback greedy si problème."""
+        try:
+            return self.model.generate(
+                **inputs,
+                max_new_tokens=self.new_tokens,
+                do_sample=self.config.do_sample,
+                temperature=self.config.temperature,
+                top_k=self.config.top_k,
+                top_p=self.config.top_p,
+            )
+        except RuntimeError as e:
+            if self.config.enable_greedy_fallback:
+                print("⚠️ Sampling a échoué, fallback en greedy (do_sample=False).", e)
+                torch.cuda.empty_cache()
+                return self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.new_tokens,
+                    do_sample=False,   # greedy
+                )
+            raise
+
+    # --------- boucle d'entraînement ---------
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -126,89 +166,79 @@ class GRPOTrainerWrapper:
             prompts = batch["prompts"]
             answers = batch["answers"]
 
-            # --- Tokenize prompts ---
+            # Tokenize prompts
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
-            # --- Génération avec sampling ---
+            # Génération (robuste)
             with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.new_tokens,
-                    do_sample=True,
-                    temperature=self.temperature,
-                )
+                outputs = self._generate(**inputs)
             generations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # --- Reward (math accuracy simple) ---
+            # Reward (math accuracy "contient la réponse")
             rewards = []
             for gen, ans in zip(generations, answers):
-                if ans and ans in gen:
-                    rewards.append(1.0)
-                else:
-                    rewards.append(0.0)
+                rewards.append(1.0 if (ans and (ans in gen)) else 0.0)
             rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
 
-            # --- Normalisation / Avantages ---
+            # Avantages
             advantages = self.compute_advantages(rewards)
 
-            # --- Re-tokenize generations ---
+            # Re-tokenize generations
             batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
 
-            logits = self.model(**batch_outputs).logits
+            # IMPORTANT: calcule en float32 pour stabilité
+            logits = self.model(**batch_outputs).logits.float()
             logprobs = F.log_softmax(logits, dim=-1)
             gen_logprobs = logprobs[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
-            # --- Ref logprobs (baseline gelée) ---
             with torch.no_grad():
-                ref_logits = self.ref_model(**batch_outputs).logits
-            ref_logprobs = F.log_softmax(ref_logits, dim=-1)[:, -1, :].gather(
+                ref_logits = self.ref_model(**batch_outputs).logits.float()
+                ref_logprobs_all = F.log_softmax(ref_logits, dim=-1)
+            ref_logprobs = ref_logprobs_all[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
-            # --- PPO surrogate loss ---
+            # PPO surrogate
             ratio = torch.exp(gen_logprobs - ref_logprobs)
             unclipped = ratio * advantages
             clipped = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
             policy_loss = -torch.min(unclipped, clipped).mean()
 
-            # --- KL penalty ---
+            # KL + Entropie
             kl_loss = self.kl_penalty(gen_logprobs, ref_logprobs)
-
-            # --- Entropy bonus ---
             entropy = -(logprobs.exp() * logprobs).sum(-1).mean()
             entropy_bonus = -self.config.entropy_coef * entropy
 
-            # --- Final loss ---
             loss = policy_loss + kl_loss + entropy_bonus
 
-            # --- Optim step ---
+            # Optim
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
             self.optimizer.step()
             self.scheduler.step()
-
             self.global_step += 1
 
-            # --- Logs ---
+            # Logs TB
             if self.writer:
-                self.writer.add_scalar("loss/policy", policy_loss.item(), self.global_step)
-                self.writer.add_scalar("loss/kl", kl_loss.item(), self.global_step)
-                self.writer.add_scalar("loss/entropy", entropy.item(), self.global_step)
-                self.writer.add_scalar("loss/total", loss.item(), self.global_step)
-                self.writer.add_scalar("reward/mean", rewards.mean().item(), self.global_step)
-                self.writer.add_scalar("reward/std", rewards.std().item(), self.global_step)
-                self.writer.add_scalar("clip/ratio_mean", ratio.mean().item(), self.global_step)
+                self.writer.add_scalar("loss/policy", float(policy_loss.item()), self.global_step)
+                self.writer.add_scalar("loss/kl", float(kl_loss.item()), self.global_step)
+                self.writer.add_scalar("loss/entropy", float(entropy.item()), self.global_step)
+                self.writer.add_scalar("loss/total", float(loss.item()), self.global_step)
+                self.writer.add_scalar("reward/mean", float(rewards.mean().item()), self.global_step)
+                self.writer.add_scalar("reward/std", self._std_safe(rewards), self.global_step)
+                self.writer.add_scalar("clip/ratio_mean", float(ratio.mean().item()), self.global_step)
 
             if step % 10 == 0:
                 print(
-                    f"[Step {step}] loss={loss.item():.4f} reward_mean={rewards.mean().item():.3f} "
-                    f"clip_ratio_mean={ratio.mean().item():.3f} entropy={entropy.item():.3f}"
+                    f"[Step {step}] loss={float(loss.item()):.4f} "
+                    f"reward_mean={float(rewards.mean().item()):.3f} "
+                    f"clip_ratio_mean={float(ratio.mean().item()):.3f} "
+                    f"entropy={float(entropy.item()):.3f}"
                 )
 
-            # --- ✅ Checkpoint périodique ---
             if step > 0 and step % self.config.save_steps == 0:
                 self._save_checkpoint(step)
 
