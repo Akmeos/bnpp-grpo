@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# GRPO "serré": rewards normalisées robustes, PPO clip, KL control avec ref model,
-# entropy bonus, checkpoints périodiques, génération robuste (fallback greedy),
-# et calcul des logprobs en float32 pour éviter les NaN en fp16.
+# GRPO Trainer robuste
+# - Rewards normalisées safe
+# - PPO clip
+# - KL control avec ref_model gelé
+# - Entropy bonus
+# - Logits clampés (évite NaN)
+# - pad_token_id défini
+# - Fallback greedy si sampling plante
+# - Checkpoints périodiques
 
 import os
 import copy
@@ -25,18 +31,16 @@ class GRPOConfig:
         warmup_steps=50,
         max_grad_norm=1.0,
         gamma=1.0,
-        clip_range=0.2,           # PPO clipping
-        kl_coef=0.1,              # coefficient KL
-        kl_target=None,           # seuil cible (optionnel pour early stop)
-        entropy_coef=0.01,        # bonus entropie
-        normalize_rewards=True,   # normalisation reward par batch
-        save_steps=50,            # fréquence checkpoints
-        # sampling par défaut (plus stable que sampling "libre")
+        clip_range=0.2,
+        kl_coef=0.1,
+        kl_target=None,
+        entropy_coef=0.01,
+        normalize_rewards=True,
+        save_steps=50,
         do_sample=True,
         temperature=0.7,
         top_k=50,
         top_p=0.95,
-        # fallback si sampling casse (CUDA multinomial assert)
         enable_greedy_fallback=True,
     ):
         self.learning_rate = learning_rate
@@ -78,10 +82,9 @@ class GRPOTrainerWrapper:
         self.no_vllm = no_vllm
         self.writer = writer
         self.global_step = 0
-        # si un temperature est passé par train.py, on surcouche la config
         self.config = config or GRPOConfig(temperature=temperature)
 
-        # Modèle de référence (gelé) pour le KL
+        # Modèle de référence (gelé)
         self.ref_model = copy.deepcopy(model).eval()
         for p in self.ref_model.parameters():
             p.requires_grad = False
@@ -99,7 +102,7 @@ class GRPOTrainerWrapper:
             num_training_steps=max_steps,
         )
 
-    # --------- utilitaires ---------
+    # --------- utils ---------
 
     @staticmethod
     def _std_safe(x: torch.Tensor) -> float:
@@ -109,7 +112,6 @@ class GRPOTrainerWrapper:
         return float(s.item()) if torch.isfinite(s) else 0.0
 
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        """Normalisation robuste des rewards"""
         if self.config.normalize_rewards:
             if rewards.numel() <= 1:
                 return rewards - rewards.mean()
@@ -120,7 +122,6 @@ class GRPOTrainerWrapper:
         return rewards
 
     def kl_penalty(self, logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
-        """KL approx (diff de logprobs moyens)"""
         kl = (logprobs - ref_logprobs).mean()
         return self.config.kl_coef * kl
 
@@ -132,7 +133,6 @@ class GRPOTrainerWrapper:
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
 
     def _generate(self, **inputs):
-        """Génération robuste: sampling par défaut, fallback greedy si problème."""
         try:
             return self.model.generate(
                 **inputs,
@@ -141,19 +141,21 @@ class GRPOTrainerWrapper:
                 temperature=self.config.temperature,
                 top_k=self.config.top_k,
                 top_p=self.config.top_p,
+                pad_token_id=self.tokenizer.eos_token_id,
             )
         except RuntimeError as e:
-            if self.config.enable_greedy_fallback:
-                print("⚠️ Sampling a échoué, fallback en greedy (do_sample=False).", e)
+            if "multinomial" in str(e) and self.config.enable_greedy_fallback:
+                print("⚠️ Sampling a échoué. Fallback greedy.")
                 torch.cuda.empty_cache()
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
-                    do_sample=False,   # greedy
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.eos_token_id,
                 )
             raise
 
-    # --------- boucle d'entraînement ---------
+    # --------- training ---------
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -166,15 +168,15 @@ class GRPOTrainerWrapper:
             prompts = batch["prompts"]
             answers = batch["answers"]
 
-            # Tokenize prompts
+            # Prompts
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
-            # Génération (robuste)
+            # Génération
             with torch.no_grad():
                 outputs = self._generate(**inputs)
             generations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # Reward (math accuracy "contient la réponse")
+            # Rewards
             rewards = []
             for gen, ans in zip(generations, answers):
                 rewards.append(1.0 if (ans and (ans in gen)) else 0.0)
@@ -183,24 +185,25 @@ class GRPOTrainerWrapper:
             # Avantages
             advantages = self.compute_advantages(rewards)
 
-            # Re-tokenize generations
+            # Logprobs modèle courant
             batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
-
-            # IMPORTANT: calcule en float32 pour stabilité
             logits = self.model(**batch_outputs).logits.float()
             logprobs = F.log_softmax(logits, dim=-1)
+            logprobs = torch.clamp(logprobs, min=-20, max=0)
             gen_logprobs = logprobs[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
+            # Ref logprobs
             with torch.no_grad():
                 ref_logits = self.ref_model(**batch_outputs).logits.float()
                 ref_logprobs_all = F.log_softmax(ref_logits, dim=-1)
+                ref_logprobs_all = torch.clamp(ref_logprobs_all, min=-20, max=0)
             ref_logprobs = ref_logprobs_all[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
-            # PPO surrogate
+            # PPO
             ratio = torch.exp(gen_logprobs - ref_logprobs)
             unclipped = ratio * advantages
             clipped = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
@@ -210,7 +213,6 @@ class GRPOTrainerWrapper:
             kl_loss = self.kl_penalty(gen_logprobs, ref_logprobs)
             entropy = -(logprobs.exp() * logprobs).sum(-1).mean()
             entropy_bonus = -self.config.entropy_coef * entropy
-
             loss = policy_loss + kl_loss + entropy_bonus
 
             # Optim
@@ -221,7 +223,7 @@ class GRPOTrainerWrapper:
             self.scheduler.step()
             self.global_step += 1
 
-            # Logs TB
+            # Logs
             if self.writer:
                 self.writer.add_scalar("loss/policy", float(policy_loss.item()), self.global_step)
                 self.writer.add_scalar("loss/kl", float(kl_loss.item()), self.global_step)
@@ -242,7 +244,6 @@ class GRPOTrainerWrapper:
             if step > 0 and step % self.config.save_steps == 0:
                 self._save_checkpoint(step)
 
-        # Sauvegarde finale
         os.makedirs(self.output_dir, exist_ok=True)
         self.model.save_pretrained(self.output_dir)
         self.tokenizer.save_pretrained(self.output_dir)
