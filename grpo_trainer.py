@@ -207,9 +207,10 @@ class GRPOTrainerWrapper:
         forced_prefix_ids = self.tokenizer.encode(forced_prefix, add_special_tokens=False)
         print(f"Forced prefix '{forced_prefix}' -> token IDs: {forced_prefix_ids}")
         
-        # Créer un processeur pour forcer le préfixe
+        # Créer un processeur pour forcer le préfixe - CORRECTION: hériter de LogitsProcessor
         class ForcePrefixProcessor(LogitsProcessor):
             def __init__(self, tokenizer, base_len, forced_prefix_ids):
+                super().__init__()  # AJOUTER CETTE LIGNE
                 self.tokenizer = tokenizer
                 self.base_len = base_len
                 self.forced_prefix_ids = forced_prefix_ids
@@ -227,9 +228,10 @@ class GRPOTrainerWrapper:
                 
                 return scores
         
-        # Processeur pour booster les digits après le préfixe
+        # Processeur pour booster les digits après le préfixe - CORRECTION: hériter de LogitsProcessor
         class DigitAfterPrefixBoost(LogitsProcessor):
             def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 15.0):
+                super().__init__()  # AJOUTER CETTE LIGNE
                 self.tokenizer = tokenizer
                 self.base_len = base_len
                 self.forced_prefix_len = len(forced_prefix_ids)
@@ -242,21 +244,22 @@ class GRPOTrainerWrapper:
                     if len(ids) == 1:
                         self.allowed_ids.add(ids[0])
                 self.allowed_ids = list(self.allowed_ids)
+                print(f"Allowed digit tokens: {self.allowed_ids}")
+            
+            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+                cur_len = input_ids.shape[1]
+                gen_step = cur_len - self.base_len
+                
+                # Appliquer le boost seulement après le préfixe "#### "
+                if gen_step >= self.forced_prefix_len and self.allowed_ids:
+                    scores[:, self.allowed_ids] = scores[:, self.allowed_ids] + self.boost
+                
+                return scores
         
-        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-            cur_len = input_ids.shape[1]
-            gen_step = cur_len - self.base_len
-            
-            # Appliquer le boost seulement après le préfixe "#### "
-            if gen_step >= self.forced_prefix_len and self.allowed_ids:
-                scores[:, self.allowed_ids] = scores[:, self.allowed_ids] + self.boost
-            
-            return scores
-    
         # Combiner les processeurs
         lp = LogitsProcessorList([
             ForcePrefixProcessor(self.tokenizer, base_len, forced_prefix_ids),
-            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=10.0)
+            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=15.0)
         ])
         
         try:
@@ -264,7 +267,7 @@ class GRPOTrainerWrapper:
                 return self.model.generate(
                     **inputs,
                     max_new_tokens=self.new_tokens,
-                    min_new_tokens=6,  # Au moins "#### " + 1 chiffre
+                    min_new_tokens=6,
                     do_sample=True,
                     temperature=max(self.config.temperature, 1e-5),
                     top_k=self.config.top_k,
@@ -272,7 +275,7 @@ class GRPOTrainerWrapper:
                     pad_token_id=self.tokenizer.eos_token_id,
                     logits_processor=lp,
                     bad_words_ids=self.bad_words_ids or None,
-                    repetition_penalty=1.1,  # Éviter la répétition
+                    repetition_penalty=1.1,
                 )
             else:
                 return self.model.generate(
@@ -301,7 +304,6 @@ class GRPOTrainerWrapper:
                 bad_words_ids=self.bad_words_ids or None,
                 repetition_penalty=1.1,
             )
-
     # ===== Reward shaping progressif =====
     def _reward(self, suffix: str, gold_str: str) -> float:
         """
