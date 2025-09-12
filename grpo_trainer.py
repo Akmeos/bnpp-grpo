@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 # GRPO Trainer robuste :
-# - Format de sortie imposé côté data_loader (#### )
-# - Extraction numérique robuste
-# - Reward shaping (jamais tout à zéro si format suivi)
-# - Skip update si reward==0 partout (sécurité)
-# - PPO clip + KL vs ref_model gelé + Entropy bonus faible
+# - Décodage du SEUL suffixe généré (pas le prompt)
+# - Extraction stricte du nombre en début de suffixe
+# - Reward = 1/0.8/0.5/0 uniquement sur ce nombre
+# - Skip update si reward==0 partout
+# - PPO clip + KL (ref gelé) + entropy faible
 # - clamp/nan_to_num
-# - Fallback greedy si generate() plante
-# - Logs TensorBoard + debug batch 0
+# - Greedy par défaut (Kaggle/T4), fallback greedy si sampling échoue
+# - Logs TB + debug batch 0
 
 import os
 import copy
@@ -21,11 +21,14 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_scheduler
 
-# Extraction '#### n' prioritaire sinon dernier nombre
+# Nombre AU DÉBUT du suffixe (ce que le modèle doit écrire)
+RE_BEGIN_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
+
+# Nombre attendu dans le label (on prend le dernier '#### n' ou dernier nombre si besoin)
 RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
 
-def extract_number_any(text: str) -> float | None:
+def extract_label_number(text: str) -> float | None:
     if not text:
         return None
     m = RE_HASH.search(text)
@@ -42,11 +45,23 @@ def extract_number_any(text: str) -> float | None:
             return None
     return None
 
+def extract_pred_number_from_suffix(suffix: str) -> float | None:
+    """Prend UNIQUEMENT le nombre au début du suffixe généré."""
+    if not suffix:
+        return None
+    m = RE_BEGIN_NUM.match(suffix.strip())
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
 
 class GRPOConfig:
     def __init__(
         self,
-        learning_rate=5e-5,      # low LR pour stabilité T4
+        learning_rate=5e-5,
         weight_decay=0.01,
         warmup_steps=50,
         max_grad_norm=1.0,
@@ -54,7 +69,7 @@ class GRPOConfig:
         clip_range=0.2,
         kl_coef=0.05,
         kl_target=None,
-        entropy_coef=0.001,      # bonus entropie faible
+        entropy_coef=0.001,
         normalize_rewards=True,
         save_steps=50,
         do_sample=False,         # greedy par défaut (Kaggle)
@@ -91,7 +106,7 @@ class GRPOTrainerWrapper:
         output_dir="outputs/grpo-granite",
         max_steps=100,
         temperature=0.7,
-        new_tokens=32,   # court car on force '#### ' (quelques digits suffisent)
+        new_tokens=16,   # court : on attend juste quelques chiffres
         writer: SummaryWriter = None,
         config: GRPOConfig = None,
     ):
@@ -183,28 +198,23 @@ class GRPOTrainerWrapper:
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-    def _shape_reward(self, generation: str, answer: str) -> float:
+    def _reward(self, suffix: str, gold_str: str) -> float:
         """
-        Reward façonnée :
-        +0.20 si '####' présent
-        +0.20 si un nombre est détecté après parsing
-        +0.60 si exact (diff==0)
-        (clip 0..1)
+        Reward stricte basée sur le NOMBRE AU DÉBUT DU SUFFIXE.
+        1.0 si exact, 0.8 si |diff|<1e-3, 0.5 si |diff|<1.0, sinon 0.
         """
-        score = 0.0
-        if "####" in generation:
-            score += 0.20
-
-        pred = extract_number_any(generation)
-        gold = extract_number_any(answer)
-
-        if pred is not None:
-            score += 0.20
-
-        if pred is not None and gold is not None and abs(pred - gold) == 0:
-            score += 0.60
-
-        return min(max(score, 0.0), 1.0)
+        pred = extract_pred_number_from_suffix(suffix)
+        gold = extract_label_number(gold_str)
+        if pred is None or gold is None:
+            return 0.0
+        diff = abs(pred - gold)
+        if diff == 0:
+            return 1.0
+        if diff < 1e-3:
+            return 0.8
+        if diff < 1.0:
+            return 0.5
+        return 0.0
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -215,18 +225,22 @@ class GRPOTrainerWrapper:
                 break
 
             prompts = batch["prompts"]
-            answers = batch["answers"]
+            golds = batch["answers"]
 
             # Tokenize prompts
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+            prompt_len = inputs["input_ids"].shape[1]
 
             # Génération
             with torch.no_grad():
                 outputs = self._generate(**inputs)
-            generations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # Rewards (shaping)
-            rewards_list = [self._shape_reward(gen, ans) for gen, ans in zip(generations, answers)]
+            # ❗ On ne garde QUE le suffixe généré
+            gen_ids = outputs[:, prompt_len:]
+            suffixes = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+
+            # Rewards (strictes)
+            rewards_list = [self._reward(suf, gold) for suf, gold in zip(suffixes, golds)]
             rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
             rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
 
@@ -234,15 +248,13 @@ class GRPOTrainerWrapper:
             if self.config.debug_print_first_batch and step == 0:
                 print("=== DEBUG batch 0 ===")
                 for i in range(min(2, len(prompts))):
-                    print("PROMPT (fin) ↓")
-                    print("\n".join(prompts[i].splitlines()[-4:]))
-                    print("GENERATION ↓")
-                    print(generations[i][:240].replace("\n", "\\n"))
-                    print("LABEL =", answers[i])
+                    print("SUFFIX GENERATED ↓")
+                    print(suffixes[i][:200].replace("\n", "\\n"))
+                    print("LABEL =", golds[i])
                     print("REWARD =", rewards_list[i])
                 print("=====================")
 
-            # Skip update si toutes les rewards sont nulles (sécurité)
+            # Skip update si tout 0
             if float(rewards.sum().item()) == 0.0:
                 if self.writer:
                     self.writer.add_scalar("reward/mean", 0.0, self.global_step)
@@ -252,30 +264,25 @@ class GRPOTrainerWrapper:
                 self.global_step += 1
                 continue
 
-            # Avantages
             advantages = self.compute_advantages(rewards)
 
-            # Re-tokenize generations
-            batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
+            # Re-tokenize suffixes (policy & ref sur le même texte)
+            outs = self.tokenizer(suffixes, return_tensors="pt", padding=True, truncation=True).to(device)
 
             # Logits courants
-            logits = self.model(**batch_outputs).logits
+            logits = self.model(**outs).logits
             logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
             logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.clamp(torch.nan_to_num(logprobs, nan=-20.0), min=-20, max=0)
-            gen_logprobs = logprobs[:, -1, :].gather(
-                1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
-            ).squeeze()
+            gen_logprobs = logprobs[:, -1, :].gather(1, outs["input_ids"][:, -1].unsqueeze(-1)).squeeze()
 
             # Logprobs référence
             with torch.no_grad():
-                ref_logits = self.ref_model(**batch_outputs).logits
+                ref_logits = self.ref_model(**outs).logits
                 ref_logits = torch.nan_to_num(ref_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
                 ref_lp_all = F.log_softmax(ref_logits, dim=-1)
                 ref_lp_all = torch.clamp(torch.nan_to_num(ref_lp_all, nan=-20.0), min=-20, max=0)
-            ref_logprobs = ref_lp_all[:, -1, :].gather(
-                1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
-            ).squeeze()
+            ref_logprobs = ref_lp_all[:, -1, :].gather(1, outs["input_ids"][:, -1].unsqueeze(-1)).squeeze()
 
             # PPO
             ratio = torch.exp(torch.clamp(gen_logprobs - ref_logprobs, min=-20, max=20))
@@ -285,7 +292,8 @@ class GRPOTrainerWrapper:
 
             # KL + Entropie
             kl_loss = self.kl_penalty(gen_logprobs, ref_logprobs)
-            entropy = -(logprobs.exp() * logprobs).sum(-1).mean()
+            # Entropie du dernier pas (sur suffixes)
+            entropy = -(logprobs[:, -1, :].exp() * logprobs[:, -1, :]).sum(-1).mean()
             entropy_bonus = -self.config.entropy_coef * entropy
             loss = policy_loss + kl_loss + entropy_bonus
 
