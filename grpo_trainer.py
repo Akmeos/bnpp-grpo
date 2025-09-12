@@ -186,10 +186,7 @@ class GRPOTrainerWrapper:
             rewards = []
             for gen, ans in zip(generations, answers):
                 pred = extract_final_number(gen)
-                try:
-                    gold = float(ans.strip())
-                except:
-                    gold = None
+                gold = extract_final_number(ans)
 
                 if pred is None or gold is None:
                     rewards.append(0.0)
