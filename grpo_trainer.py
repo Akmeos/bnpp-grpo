@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# GRPO Trainer robuste :
-# - Forçage format de sortie (prompt côté data_loader)
-# - Extraction numérique robuste
-# - Reward shaping (jamais tout à 0 si format respecté)
-# - Skip update si reward==0 partout (sécurité)
-# - PPO clip + KL ref_model gelé + Entropy bonus
-# - clamp / nan_to_num
-# - Fallback greedy si generate() plante
-
 import os
-import copy
-import re
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_scheduler
+import re
 
+# --- extraction du nombre final ---
 RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
-RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
 
-def extract_number_any(text: str) -> float | None:
+def extract_final_number(text: str) -> float | None:
+    """Extrait le nombre après #### sinon None"""
     if not text:
         return None
     m = RE_HASH.search(text)
@@ -32,35 +23,24 @@ def extract_number_any(text: str) -> float | None:
             return float(m.group(1))
         except Exception:
             return None
-    nums = list(RE_ANY.finditer(text))
-    if nums:
-        try:
-            return float(nums[-1].group(0))
-        except Exception:
-            return None
     return None
 
+# ============ CONFIG ============
 
 class GRPOConfig:
     def __init__(
         self,
-        learning_rate=5e-5,      # bas pour éviter instabilités
+        learning_rate=2e-4,
         weight_decay=0.01,
         warmup_steps=50,
         max_grad_norm=1.0,
         gamma=1.0,
-        clip_range=0.2,
-        kl_coef=0.05,
-        kl_target=None,
-        entropy_coef=0.005,
-        normalize_rewards=True,
-        save_steps=50,
-        do_sample=False,         # greedy par défaut (Kaggle/T4)
-        temperature=0.7,
-        top_k=50,
-        top_p=0.95,
-        enable_greedy_fallback=True,
-        debug_print_first_batch=True,
+        clip_range=0.2,           # PPO clipping
+        kl_coef=0.1,              # coefficient KL
+        kl_target=None,           # seuil cible (optionnel pour early stop)
+        entropy_coef=0.001,       # 🔽 bonus entropie réduit
+        normalize_rewards=True,   # normalisation reward par batch
+        save_steps=50,            # checkpoints périodiques
     ):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
@@ -73,13 +53,9 @@ class GRPOConfig:
         self.entropy_coef = entropy_coef
         self.normalize_rewards = normalize_rewards
         self.save_steps = save_steps
-        self.do_sample = do_sample
-        self.temperature = temperature
-        self.top_k = top_k
-        self.top_p = top_p
-        self.enable_greedy_fallback = enable_greedy_fallback
-        self.debug_print_first_batch = debug_print_first_batch
 
+
+# ============ TRAINER ============
 
 class GRPOTrainerWrapper:
     def __init__(
@@ -89,8 +65,7 @@ class GRPOTrainerWrapper:
         output_dir="outputs/grpo-granite",
         max_steps=100,
         temperature=0.7,
-        new_tokens=32,   # court car on force '#### ' (quelques digits suffisent)
-        no_vllm=True,
+        new_tokens=256,
         writer: SummaryWriter = None,
         config: GRPOConfig = None,
     ):
@@ -98,18 +73,13 @@ class GRPOTrainerWrapper:
         self.tokenizer = tokenizer
         self.output_dir = output_dir
         self.max_steps = max_steps
+        self.temperature = temperature
         self.new_tokens = new_tokens
-        self.no_vllm = no_vllm
         self.writer = writer
         self.global_step = 0
-        self.config = config or GRPOConfig(temperature=temperature)
+        self.config = config or GRPOConfig()
 
-        # Référence gelée
-        self.ref_model = copy.deepcopy(model).eval()
-        for p in self.ref_model.parameters():
-            p.requires_grad = False
-
-        # Optim & scheduler
+        # Optimizer + Scheduler
         self.optimizer = AdamW(
             filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=self.config.learning_rate,
@@ -119,32 +89,22 @@ class GRPOTrainerWrapper:
             "linear",
             self.optimizer,
             num_warmup_steps=self.config.warmup_steps,
-            num_training_steps=max(self.max_steps, 1),
+            num_training_steps=max_steps,
         )
 
-    @staticmethod
-    def _std_safe(x: torch.Tensor) -> float:
-        if x.numel() <= 1:
-            return 0.0
-        s = x.std()
-        return float(s.item()) if torch.isfinite(s) else 0.0
-
     def compute_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
-        rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=0.0)
-        if self.config.normalize_rewards:
-            if rewards.numel() <= 1:
-                return rewards - rewards.mean()
-            std = rewards.std()
-            if not torch.isfinite(std) or std < 1e-6:
-                return rewards - rewards.mean()
-            return (rewards - rewards.mean()) / (std + 1e-8)
+        """Calcule les avantages centrés/rééchelonnés pour PPO"""
+        if self.config.normalize_rewards and rewards.numel() > 1:
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
         return rewards
 
     def kl_penalty(self, logprobs: torch.Tensor, ref_logprobs: torch.Tensor) -> torch.Tensor:
+        """KL divergence entre la policy courante et une policy de référence"""
         kl = (logprobs - ref_logprobs).mean()
         return self.config.kl_coef * kl
 
     def _save_checkpoint(self, step: int):
+        """Sauvegarde périodique du modèle"""
         ckpt_path = os.path.join(self.output_dir, f"checkpoint-{step}")
         os.makedirs(ckpt_path, exist_ok=True)
         self.model.save_pretrained(ckpt_path)
@@ -152,60 +112,22 @@ class GRPOTrainerWrapper:
         print(f"💾 Checkpoint sauvegardé: {ckpt_path}")
 
     def _generate(self, **inputs):
+        """Génération robuste avec fallback greedy"""
         try:
             return self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
-                do_sample=self.config.do_sample,
-                temperature=max(self.config.temperature, 1e-5),
-                top_k=self.config.top_k,
-                top_p=self.config.top_p,
-                pad_token_id=self.tokenizer.eos_token_id,
+                do_sample=True,  # on garde sampling
+                temperature=self.temperature,
+                top_p=0.9,
             )
         except Exception as e:
-            print(f"⚠️ Sampling a échoué ({e}). Fallback greedy.")
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            print(f"⚠️ Sampling a échoué ({e}), fallback en greedy")
             return self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
+                do_sample=False
             )
-
-    def _shape_reward(self, generation: str, answer: str) -> float:
-        """
-        Reward façonnée :
-        +0.05 si '####' présent
-        +0.05 si un nombre est détecté
-        +0.40 si exact (diff=0)
-        +0.30 si diff<1e-3
-        +0.20 si diff<1
-        (clip 0..1)
-        """
-        score = 0.0
-        if "####" in generation:
-            score += 0.05
-
-        pred = extract_number_any(generation)
-        gold = extract_number_any(answer)
-
-        if pred is not None:
-            score += 0.05
-
-        if pred is None or gold is None:
-            return min(max(score, 0.0), 1.0)
-
-        diff = abs(pred - gold)
-        if diff == 0:
-            score += 0.40
-        elif diff < 1e-3:
-            score += 0.30
-        elif diff < 1.0:
-            score += 0.20
-        return min(max(score, 0.0), 1.0)
 
     def train(self, dataloader: DataLoader):
         self.model.train()
@@ -218,70 +140,63 @@ class GRPOTrainerWrapper:
             prompts = batch["prompts"]
             answers = batch["answers"]
 
+            # --- Tokenize prompts ---
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
+            # --- Génération ---
             with torch.no_grad():
                 outputs = self._generate(**inputs)
             generations = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
-            # --- Reward shaping ---
-            rewards_list = [self._shape_reward(gen, ans) for gen, ans in zip(generations, answers)]
-            rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
-            rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
+            # --- Rewards (shaping) ---
+            rewards = []
+            rewards_exact, rewards_format = 0, 0
+            for gen, ans in zip(generations, answers):
+                pred = extract_final_number(gen)
+                gold = extract_final_number(ans)
 
-            # Debug un seul coup sur le premier batch
-            if self.config.debug_print_first_batch and step == 0:
-                print("=== DEBUG batch 0 ===")
-                for i in range(min(2, len(prompts))):
-                    print("PROMPT ↓")
-                    print(prompts[i].splitlines()[-4:])  # fin du prompt
-                    print("GENERATION ↓")
-                    print(generations[i][:200].replace("\n", "\\n"))
-                    print("ANSWER(label) =", answers[i])
-                    print("REWARD =", rewards_list[i])
-                print("=====================")
+                r = 0.0
+                if pred is not None:
+                    rewards_format += 1
+                    r += 0.2  # format respecté
 
-            # Skip update si tout zéro (sécurité)
-            if float(rewards.sum().item()) == 0.0:
-                if self.writer:
-                    self.writer.add_scalar("reward/mean", 0.0, self.global_step)
-                    self.writer.add_scalar("reward/std", 0.0, self.global_step)
-                if step % 10 == 0:
-                    print(f"[Step {step}] skip update (all rewards=0)")
-                self.global_step += 1
-                continue
+                if pred is not None and gold is not None and abs(pred - gold) < 1e-6:
+                    rewards_exact += 1
+                    r += 0.5  # exact match
 
+                rewards.append(r)
+
+            rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
             advantages = self.compute_advantages(rewards)
 
+            # --- Tokenize outputs ---
             batch_outputs = self.tokenizer(generations, return_tensors="pt", padding=True, truncation=True).to(device)
-
             logits = self.model(**batch_outputs).logits
-            logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
             logprobs = F.log_softmax(logits, dim=-1)
-            logprobs = torch.clamp(torch.nan_to_num(logprobs, nan=-20.0), min=-20, max=0)
+
             gen_logprobs = logprobs[:, -1, :].gather(
                 1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
             ).squeeze()
 
-            with torch.no_grad():
-                ref_logits = self.ref_model(**batch_outputs).logits
-                ref_logits = torch.nan_to_num(ref_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-                ref_lp_all = F.log_softmax(ref_logits, dim=-1)
-                ref_lp_all = torch.clamp(torch.nan_to_num(ref_lp_all, nan=-20.0), min=-20, max=0)
-            ref_logprobs = ref_lp_all[:, -1, :].gather(
-                1, batch_outputs["input_ids"][:, -1].unsqueeze(-1)
-            ).squeeze()
+            ref_logprobs = gen_logprobs.detach()
 
-            ratio = torch.exp(torch.clamp(gen_logprobs - ref_logprobs, min=-20, max=20))
+            # --- PPO surrogate loss ---
+            ratio = torch.exp(gen_logprobs - ref_logprobs)
             unclipped = ratio * advantages
             clipped = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
             policy_loss = -torch.min(unclipped, clipped).mean()
 
+            # --- KL penalty ---
             kl_loss = self.kl_penalty(gen_logprobs, ref_logprobs)
+
+            # --- Entropy bonus ---
             entropy = -(logprobs.exp() * logprobs).sum(-1).mean()
             entropy_bonus = -self.config.entropy_coef * entropy
+
+            # --- Final loss ---
             loss = policy_loss + kl_loss + entropy_bonus
 
+            # --- Optim step ---
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
@@ -289,21 +204,22 @@ class GRPOTrainerWrapper:
             self.scheduler.step()
             self.global_step += 1
 
+            # --- Logs ---
             if self.writer:
-                self.writer.add_scalar("loss/policy", float(policy_loss.item()), self.global_step)
-                self.writer.add_scalar("loss/kl", float(kl_loss.item()), self.global_step)
-                self.writer.add_scalar("loss/entropy", float(entropy.item()), self.global_step)
-                self.writer.add_scalar("loss/total", float(loss.item()), self.global_step)
-                self.writer.add_scalar("reward/mean", float(rewards.mean().item()), self.global_step)
-                self.writer.add_scalar("reward/std", float(rewards.std().item()) if rewards.numel() > 1 else 0.0, self.global_step)
-                self.writer.add_scalar("clip/ratio_mean", float(ratio.mean().item()), self.global_step)
+                self.writer.add_scalar("loss/policy", policy_loss.item(), self.global_step)
+                self.writer.add_scalar("loss/kl", kl_loss.item(), self.global_step)
+                self.writer.add_scalar("loss/entropy", entropy.item(), self.global_step)
+                self.writer.add_scalar("loss/total", loss.item(), self.global_step)
+                self.writer.add_scalar("reward/mean", rewards.mean().item(), self.global_step)
+                self.writer.add_scalar("reward/exact", rewards_exact / max(1, len(rewards)), self.global_step)
+                self.writer.add_scalar("reward/format", rewards_format / max(1, len(rewards)), self.global_step)
+                self.writer.add_histogram("reward/dist", rewards.cpu().numpy(), self.global_step)
 
             if step % 10 == 0:
                 print(
-                    f"[Step {step}] loss={float(loss.item()):.4f} "
-                    f"reward_mean={float(rewards.mean().item()):.3f} "
-                    f"clip_ratio_mean={float(ratio.mean().item()):.3f} "
-                    f"entropy={float(entropy.item()):.3f}"
+                    f"[Step {step}] loss={loss.item():.4f} reward_mean={rewards.mean().item():.3f} "
+                    f"exact={rewards_exact}/{len(rewards)} format={rewards_format}/{len(rewards)} "
+                    f"clip_ratio_mean={ratio.mean().item():.3f} entropy={entropy.item():.3f}"
                 )
 
             if step > 0 and step % self.config.save_steps == 0:
@@ -312,4 +228,4 @@ class GRPOTrainerWrapper:
         os.makedirs(self.output_dir, exist_ok=True)
         self.model.save_pretrained(self.output_dir)
         self.tokenizer.save_pretrained(self.output_dir)
-        print(f"✅ Entraînement terminé. Modèle sauvegardé dans {self.output_dir}")
+        print(f"✅ Entraînement terminé. Modèle et tokenizer sauvegardés dans {self.output_dir}")
