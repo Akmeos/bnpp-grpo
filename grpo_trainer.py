@@ -245,7 +245,7 @@ class GRPOTrainerWrapper:
         
         # Processeur pour booster les digits après le préfixe - CORRECTION: hériter de LogitsProcessor
         class DigitAfterPrefixBoost(LogitsProcessor):
-            def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 8.0):
+            def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 4.0):
                 super().__init__()  # AJOUTER CETTE LIGNE
                 self.tokenizer = tokenizer
                 self.base_len = base_len
@@ -274,9 +274,12 @@ class GRPOTrainerWrapper:
         # Combiner les processeurs
         lp = LogitsProcessorList([
             ForcePrefixProcessor(self.tokenizer, base_len, forced_prefix_ids),
-            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=8.0)
+            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=4.0)
         ])
         
+        current_temp = max(0.3, self.config.temperature * (0.95 ** min(self.global_step, 50)))
+        print(f"Temperature actuelle: {current_temp:.3f} (step {self.global_step})")
+            
         try:
             if self.config.do_sample:
                 return self.model.generate(
@@ -284,7 +287,7 @@ class GRPOTrainerWrapper:
                     max_new_tokens=self.new_tokens,
                     min_new_tokens=6,
                     do_sample=True,
-                    temperature=max(self.config.temperature, 1e-5),
+                    temperature=max(current_temp, 1e-5),
                     top_k=self.config.top_k,
                     top_p=self.config.top_p,
                     pad_token_id=self.tokenizer.eos_token_id,
@@ -322,13 +325,11 @@ class GRPOTrainerWrapper:
     # ===== Reward shaping progressif =====
     def _reward(self, suffix: str, gold_str: str) -> float:
         """
-        Récompense STRICTE : format "#### nombre" + exactitude numérique
+        Récompense avec pénalité pour les nombres absurdes
         """
-        # Vérifier que le suffixe commence par "####"
         if not suffix.strip().startswith("####"):
             return 0.0
         
-        # Extraire le nombre
         pred = extract_pred_number_from_suffix_head(suffix)
         
         try:
@@ -336,16 +337,22 @@ class GRPOTrainerWrapper:
             
             if gold is None or pred is None:
                 return 0.0
+            
+            # ⭐⭐ NOUVEAU : Pénalité pour les nombres déraisonnables ⭐⭐
+            if abs(pred) > 1000000:  # Nombres > 1 million = absurde
+                return 0.01
+            if abs(pred - gold) > 100000:  # Erreur > 100,000 = absurde
+                return 0.01
                 
-            # Récompense basée sur l'exactitude
+            # Récompense normale
             if pred == gold:
                 return 1.0
-            elif abs(pred - gold) < 0.01:  # Tolérance pour erreurs d'arrondi
+            elif abs(pred - gold) < 0.01:
                 return 0.8
-            elif abs(pred - gold) / max(1.0, abs(gold)) < 0.1:  # Erreur relative < 10%
+            elif abs(pred - gold) / max(1.0, abs(gold)) < 0.1:
                 return 0.4
             else:
-                return 0.1  # Mauvais nombre mais bon format
+                return 0.1
         except (ValueError, TypeError):
             return 0.0
 
