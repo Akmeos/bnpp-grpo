@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Training monitoring and visualization class for GRPO training.
+Tracks metrics, generates plots, and monitors memory usage.
+"""
+
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime
@@ -10,7 +15,10 @@ from config import config
 
 
 class TrainingMonitor:
+    """Monitors training progress, logs metrics, and generates visualizations."""
+    
     def __init__(self):
+        """Initialize training monitor with empty metrics storage."""
         self.metrics = {
             'rewards': [],
             'losses': [],
@@ -19,61 +27,66 @@ class TrainingMonitor:
         }
         self.start_time = datetime.now()
         
-        # Création du dossier de logs si nécessaire
+        # Create logs directory if it doesn't exist
         os.makedirs(config.output_dir, exist_ok=True)
     
     def log_metrics(self, metrics_dict, step):
-        """Enregistre les métriques d'entraînement"""
-        # Stockage des métriques
+        """Log training metrics and perform periodic saving/plotting.
+        
+        Args:
+            metrics_dict (dict): Dictionary containing metric values
+            step (int): Current training step
+        """
+        # Store metrics
         if 'reward' in metrics_dict:
             self.metrics['rewards'].append(metrics_dict['reward'])
             self.metrics['steps'].append(step)
         
-        # Affichage console
+        # Console output
         print(f"📊 Step {step}: Reward={metrics_dict.get('reward', 'N/A'):.3f}")
         
-        # Sauvegarde périodique
+        # Periodic saving
         if step % config.logging_steps == 0:
             self._save_metrics()
             self.plot_training_progress()
-            self.log_memory_usage()  # Surveillance mémoire
+            self.log_memory_usage()  # Memory monitoring
     
     def _save_metrics(self):
-        """Sauvegarde les métriques dans un fichier"""
+        """Save metrics to JSON file for persistence."""
         metrics_path = os.path.join(config.output_dir, 'training_metrics.json')
         import json
         with open(metrics_path, 'w') as f:
             json.dump(self.metrics, f, indent=2)
     
     def plot_training_progress(self):
-        """Génère des graphiques de progression de l'entraînement"""
+        """Generate training progress visualization plots."""
         if len(self.metrics['rewards']) < 2:
-            return  # Pas assez de données
+            return  # Not enough data
         
         plt.figure(figsize=(15, 5))
         
-        # Graphique des récompenses
+        # Reward evolution plot
         plt.subplot(131)
         plt.plot(self.metrics['steps'], self.metrics['rewards'], 'b-', alpha=0.7)
-        plt.title('Évolution des Récompenses')
+        plt.title('Reward Evolution')
         plt.xlabel('Step')
         plt.ylabel('Reward')
         plt.grid(True, alpha=0.3)
         
-        # Graphique des récompenses mobiles (moyenne sur 10 steps)
+        # Moving average reward (10-step window)
         if len(self.metrics['rewards']) > 10:
             plt.subplot(132)
             moving_avg = np.convolve(self.metrics['rewards'], np.ones(10)/10, mode='valid')
             plt.plot(self.metrics['steps'][9:], moving_avg, 'r-', linewidth=2)
-            plt.title('Récompense Moyenne (10 steps)')
+            plt.title('Moving Average Reward (10 steps)')
             plt.xlabel('Step')
             plt.ylabel('Moving Average Reward')
             plt.grid(True, alpha=0.3)
         
-        # Graphique de distribution des récompenses
+        # Reward distribution histogram
         plt.subplot(133)
         plt.hist(self.metrics['rewards'], bins=20, alpha=0.7, edgecolor='black', color='green')
-        plt.title('Distribution des Récompenses')
+        plt.title('Reward Distribution')
         plt.xlabel('Reward Value')
         plt.ylabel('Frequency')
         plt.grid(True, alpha=0.3)
@@ -83,70 +96,71 @@ class TrainingMonitor:
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"📈 Graphique sauvegardé: {plot_path}")
+        print(f"Plot saved: {plot_path}")
     
     def log_memory_usage(self):
-        """Log l'utilisation mémoire GPU"""
+        """Log GPU memory usage and check 16GB VRAM constraint."""
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
             max_allocated = torch.cuda.max_memory_allocated() / 1024**3
             
-            print(f"💾 GPU Memory:")
-            print(f"   - Actuel: {allocated:.2f}GB")
-            print(f"   - Réservé: {reserved:.2f}GB") 
-            print(f"   - Max: {max_allocated:.2f}GB")
+            print(f"GPU Memory:")
+            print(f"  - Current: {allocated:.2f}GB")
+            print(f"  - Reserved: {reserved:.2f}GB") 
+            print(f"  - Max: {max_allocated:.2f}GB")
             
-            # Vérification contrainte 16GB VRAM
+            # Check 16GB VRAM constraint
             if max_allocated > 16:
-                print("⚠️  ATTENTION: Dépassement de la limite de 16GB VRAM!")
+                print("⚠️ WARNING: Exceeding 16GB VRAM limit!")
             else:
-                print(f"✅ Respect de la limite: {max_allocated:.2f}GB / 16GB")
+                print(f"Within limit: {max_allocated:.2f}GB / 16GB")
         else:
-            print("📊 Mode CPU - pas de monitoring GPU mémoire")
+            print("CPU mode - no GPU memory monitoring")
     
     def final_report(self):
-        """Génère un rapport final d'entraînement"""
+        """Generate final training report with statistics and metrics."""
         total_time = (datetime.now() - self.start_time).total_seconds()
         
         print("\n" + "="*60)
-        print("📋 RAPPORT FINAL D'ENTRAÎNEMENT - TEST BNP PARIBAS")
+        print("FINAL TRAINING REPORT - BNP PARIBAS TEST")
         print("="*60)
-        print(f"⏱️  Durée totale: {total_time/60:.1f} minutes")
-        print(f"📊 Steps complétés: {len(self.metrics['steps'])}")
+        print(f"⏱️  Total duration: {total_time/60:.1f} minutes")
+        print(f"Completed steps: {len(self.metrics['steps'])}")
         
         if self.metrics['rewards']:
             avg_reward = np.mean(self.metrics['rewards'])
             max_reward = np.max(self.metrics['rewards'])
             std_reward = np.std(self.metrics['rewards'])
             
-            print(f"🏆 Récompense moyenne: {avg_reward:.3f} ± {std_reward:.3f}")
-            print(f"🎯 Récompense maximale: {max_reward:.3f}")
+            print(f"Average reward: {avg_reward:.3f} ± {std_reward:.3f}")
+            print(f"Maximum reward: {max_reward:.3f}")
             
-            # Calcul du pourcentage de réponses correctes
+            # Calculate correct answer percentage
             correct_answers = sum(1 for r in self.metrics['rewards'] if r > 0.5)
             accuracy = correct_answers / len(self.metrics['rewards']) if self.metrics['rewards'] else 0
-            print(f"✅ Exactitude: {accuracy:.2%} ({correct_answers}/{len(self.metrics['rewards'])})")
+            print(f"Accuracy: {accuracy:.2%} ({correct_answers}/{len(self.metrics['rewards'])})")
         
-        # Rapport mémoire final
+        # Final memory report
         self.log_memory_usage()
         
-        # Sauvegarde finale
+        # Final save
         self._save_metrics()
         self.plot_training_progress()
         
-        print(f"💾 Données sauvegardées dans: {config.output_dir}")
+        print(f"Data saved in: {config.output_dir}")
         print("="*60)
 
-# Pour tester le monitoring
+
+# Testing the monitoring system
 if __name__ == "__main__":
-    print("🧪 Test du système de monitoring...")
+    print("🧪 Testing monitoring system...")
     monitor = TrainingMonitor()
     
-    # Test avec des données simulées
+    # Test with simulated data
     for i in range(50):
         mock_metrics = {'reward': np.random.uniform(-0.5, 1.0)}
         monitor.log_metrics(mock_metrics, i)
     
     monitor.final_report()
-    print("✅ Test du monitoring terminé avec succès!")
+    print("Monitoring test completed successfully!")

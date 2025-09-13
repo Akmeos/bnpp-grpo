@@ -1,12 +1,28 @@
-# Core
+# Core dependencies for GRPO training with IBM Granite MoE model
+# Transformers library for model loading and training
 transformers>=4.45.0
+
+# TRL for reinforcement learning integration
 trl>=0.15.0
+
+# PEFT for parameter-efficient fine-tuning (LoRA)
 peft>=0.11.0
+
+# Accelerate for distributed training support
 accelerate>=0.28.0
+
+# Datasets for loading and processing GSM8K dataset
 datasets>=2.18.0
+
+# TensorBoard for training metrics visualization
 tensorboard>=2.14.0
+
+# Einstein operations for tensor manipulation
 einops>=0.7.0
 
-# Optionnel (utile en local/serveur, ignoré sur Kaggle si non utilisé)
+# Optional dependencies (useful for local/server deployment, ignored on Kaggle if not used)
+# vLLM for high-performance inference backend
 # vllm>=0.5.0
+
+# Bitsandbytes for quantization support (4-bit/8-bit training)
 # bitsandbytes>=0.43.0

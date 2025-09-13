@@ -1,42 +1,59 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Data loader for GSM8K dataset with reinforcement learning formatting.
+Handles data loading, answer extraction, and prompt formatting for math reasoning tasks.
+"""
 
 import re
 import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 
-# Extraction numérique robuste
-RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
-RE_ANY  = re.compile(r"-?\d+(?:\.\d+)?")
+# Robust numeric extraction patterns
+RE_HASH = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")  # Extract number after ####
+RE_ANY = re.compile(r"-?\d+(?:\.\d+)?")            # Extract any number in text
 
-def clean_answer(ans: str) -> str:
+
+def clean_answer(answer_text: str) -> str:
     """
-    Extraction plus robuste des nombres de la réponse
+    Extract clean numeric answer from GSM8K response text.
+    
+    Priority:
+    1. Number following '####' pattern (official format)
+    2. Last number in the text (fallback)
+    3. Empty string if no number found
+    
+    Args:
+        answer_text: Raw answer string from GSM8K dataset
+        
+    Returns:
+        Clean numeric string or empty string
     """
-    if not ans:
+    if not answer_text:
         return ""
     
-    # Priorité au nombre après ####
-    m = RE_HASH.search(ans)
-    if m:
-        return m.group(1)
+    # Priority 1: Extract number after #### (official format)
+    hash_match = RE_HASH.search(answer_text)
+    if hash_match:
+        return hash_match.group(1)
     
-    # Sinon chercher le dernier nombre dans le texte
-    nums = RE_ANY.findall(ans)
-    if nums:
-        return nums[-1]
+    # Priority 2: Extract last number in text (fallback)
+    numbers = RE_ANY.findall(answer_text)
+    if numbers:
+        return numbers[-1]
     
     return ""
 
 
-# Prompt concis avec format imposé
-INSTR = (
+# Instruction prompt with strict output formatting
+INSTRUCTION_PROMPT = (
     "You are a helpful math tutor. Solve the problem.\n"
     "Output ONLY the final numeric answer in the exact format: '#### number'\n"
     "Example: If the answer is 42, output: #### 42\n"
     "Do not output any other text, explanations, or formatting.\n"
 )
+
 
 def get_dataloaders(
     tokenizer,
@@ -46,22 +63,41 @@ def get_dataloaders(
     max_input_tokens: int = 768,
 ):
     """
-    Charge GSM8K (train), formate des paires (prompt, answer_clean).
-    On force la génération en terminant le prompt par '#### ' pour obtenir directement un nombre.
+    Load and format GSM8K dataset for reinforcement learning training.
+    
+    Creates prompt-answer pairs with strict output formatting to guide the model
+    towards generating only numeric answers in the required format.
+    
+    Args:
+        tokenizer: Tokenizer for text processing
+        num_samples: Number of training samples to use
+        batch_size: Batch size for DataLoader
+        shuffle: Whether to shuffle the dataset
+        max_input_tokens: Maximum input tokens for truncation
+        
+    Returns:
+        DataLoader: Formatted dataset for RL training
     """
-    ds = load_dataset("gsm8k", "main")
-    train = ds["train"].shuffle(seed=42).select(range(min(num_samples, len(ds["train"]))))
+    # Load GSM8K dataset
+    dataset = load_dataset("gsm8k", "main")
+    train_data = dataset["train"].shuffle(seed=42).select(
+        range(min(num_samples, len(dataset["train"])))
+    )
 
     prompts, answers = [], []
-    for ex in train:
-        q = ex["question"]
-        a_clean = clean_answer(ex["answer"])
-        # Prompt + préfixe '#### ' pour forcer le format
-        prompt = f"{INSTR}\nQ: {q}\nA:\n#### "
+    
+    # Format each example with strict prompt structure
+    for example in train_data:
+        question = example["question"]
+        clean_ans = clean_answer(example["answer"])
+        
+        # Construct prompt with forced output format
+        prompt = f"{INSTRUCTION_PROMPT}\nQ: {question}\nA:\n#### "
         prompts.append(prompt)
-        answers.append(a_clean)
+        answers.append(clean_ans)
 
-    class RLDS(Dataset):
+    # Custom Dataset class for RL training
+    class RLMathDataset(Dataset):
         def __init__(self, prompts, answers):
             self.prompts = prompts
             self.answers = answers
@@ -70,6 +106,29 @@ def get_dataloaders(
             return len(self.prompts)
 
         def __getitem__(self, idx):
-            return {"prompts": self.prompts[idx], "answers": self.answers[idx]}
+            return {
+                "prompts": self.prompts[idx],
+                "answers": self.answers[idx]
+            }
 
-    return DataLoader(RLDS(prompts, answers), batch_size=batch_size, shuffle=shuffle)
+    # Create DataLoader with specified parameters
+    return DataLoader(
+        RLMathDataset(prompts, answers),
+        batch_size=batch_size,
+        shuffle=shuffle
+    )
+
+
+if __name__ == "__main__":
+    # Example usage
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-3.1-1b-a400m-instruct")
+    dataloader = get_dataloaders(tokenizer, num_samples=10)
+    
+    print("DataLoader created successfully!")
+    print(f"Number of batches: {len(dataloader)}")
+    
+    # Show first example
+    first_batch = next(iter(dataloader))
+    print(f"Prompt: {first_batch['prompts'][0][:100]}...")
+    print(f"Answer: {first_batch['answers'][0]}")
