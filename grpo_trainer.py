@@ -239,97 +239,21 @@ class GRPOTrainerWrapper:
             return inputs["input_ids"]
 
     def _generate(self, base_len: int, **inputs):
-        """Robust text generation with forced prefix and digit boosting."""
+        """Simple generation without complex logits processing."""
         try:
-            # Force generation to start with "####"
-            forced_prefix = "#### "
-            forced_prefix_ids = self.tokenizer.encode(forced_prefix, add_special_tokens=False)
-            print(f"Forced prefix '{forced_prefix}' -> token IDs: {forced_prefix_ids}")
-            
-            # Logits processor to force the prefix - FIXED VERSION
-            class ForcePrefixProcessor(LogitsProcessor):
-                def __init__(self, base_len, forced_prefix_ids):
-                    self.base_len = base_len
-                    self.forced_prefix_ids = forced_prefix_ids
-                
-                def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-                    cur_len = input_ids.shape[1]
-                    gen_step = cur_len - self.base_len
-                    
-                    # Force the exact prefix tokens in sequence
-                    if gen_step < len(self.forced_prefix_ids):
-                        forced_token_id = self.forced_prefix_ids[gen_step]
-                        # Set all scores to very low except the forced token
-                        scores.fill_(-float('inf'))
-                        scores[:, forced_token_id] = 0
-                    
-                    return scores
-            
-            # Logits processor to boost digits after the prefix
-            class DigitBoostProcessor(LogitsProcessor):
-                def __init__(self, base_len, forced_prefix_ids):
-                    self.base_len = base_len
-                    self.forced_prefix_len = len(forced_prefix_ids)
-                    # Digit tokens only
-                    digit_tokens = []
-                    for digit in "0123456789.-":
-                        token_ids = self.tokenizer.encode(digit, add_special_tokens=False)
-                        if len(token_ids) == 1:
-                            digit_tokens.append(token_ids[0])
-                    self.digit_token_ids = digit_tokens
-                    print(f"Digit tokens: {self.digit_token_ids}")
-                
-                def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-                    cur_len = input_ids.shape[1]
-                    gen_step = cur_len - self.base_len
-                    
-                    # Apply boost only after the "#### " prefix is complete
-                    if gen_step >= self.forced_prefix_len and self.digit_token_ids:
-                        # Moderate digit boost
-                        scores[:, self.digit_token_ids] += 3.0
-                    
-                    return scores
-            
-            # Create logits processors
-            processors = LogitsProcessorList([
-                ForcePrefixProcessor(base_len, forced_prefix_ids),
-                DigitBoostProcessor(base_len, forced_prefix_ids)
-            ])
-            
-            # Base generation configuration
-            generation_kwargs = {
-                'max_new_tokens': self.new_tokens,
-                'pad_token_id': self.tokenizer.eos_token_id or self.tokenizer.pad_token_id,
-                'repetition_penalty': 1.1,
-                'do_sample': self.config.do_sample,
-                'logits_processor': processors,
-            }
-            
-            if self.config.do_sample:
-                generation_kwargs.update({
-                    'temperature': max(0.5, self.config.temperature),
-                    'top_p': 0.95,
-                })
-            
-            # Generate with forced prefix
-            outputs = self.model.generate(**inputs, **generation_kwargs)
-            
-            # Verify the prefix was generated correctly
-            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=False)
-            print(f"Generated text: {generated_text[ -50:]}")  # Last 50 chars
-            
-            return outputs
-                    
-        except Exception as e:
-            print(f"Critical generation failure: {e}")
-            # Fallback to simple generation without forcing
+            # Very simple generation without forcing
             return self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
-                do_sample=False,
+                do_sample=self.config.do_sample,
+                temperature=max(0.5, self.config.temperature),
                 pad_token_id=self.tokenizer.eos_token_id or self.tokenizer.pad_token_id,
+                repetition_penalty=1.1,
+                eos_token_id=self.tokenizer.eos_token_id,
             )
-
+        except Exception as e:
+            print(f"Generation failed: {e}")
+            return inputs["input_ids"]
 
     def _reward(self, suffix: str, gold_str: str) -> float:
         """
