@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim import AdamW
 from transformers import get_scheduler
 from transformers.generation.logits_process import LogitsProcessorList, LogitsProcessor
+from transformers import GenerationConfig
 
 # === Regex utilities for number extraction ===
 RE_BEGIN_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")       # Number at BEGINNING of suffix
@@ -229,134 +230,118 @@ class GRPOTrainerWrapper:
         print("Using fallback generation method (greedy decoding)")
         
         try:
-            # Use simple greedy decoding without logits processors
-            generation_config = GenerationConfig(
+            # Simple greedy decoding without logits processors
+            return self.model.generate(
+                **inputs,
                 max_new_tokens=self.new_tokens,
                 min_new_tokens=6,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
                 repetition_penalty=1.1,
             )
-            
-            return self.model.generate(
-                **inputs,
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-                output_scores=False,
-            ).sequences
         except Exception as e:
             print(f"Fallback generation also failed: {e}")
             # Return the original input as last resort to avoid complete failure
             return inputs["input_ids"]
 
     def _generate(self, base_len: int, **inputs):
-        """Generate text with forced prefix and digit boosting."""
-        # Force generation to start with "####"
-        forced_prefix = "#### "
-        forced_prefix_ids = self.tokenizer.encode(forced_prefix, add_special_tokens=False)
-        print(f"Forced prefix '{forced_prefix}' -> token IDs: {forced_prefix_ids}")
+    """Generate text with forced prefix and digit boosting."""
+    # Force generation to start with "####"
+    forced_prefix = "#### "
+    forced_prefix_ids = self.tokenizer.encode(forced_prefix, add_special_tokens=False)
+    print(f"Forced prefix '{forced_prefix}' -> token IDs: {forced_prefix_ids}")
+    
+    # Logits processor to force the prefix
+    class ForcePrefixProcessor(LogitsProcessor):
+        def __init__(self, tokenizer, base_len, forced_prefix_ids):
+            super().__init__()
+            self.tokenizer = tokenizer
+            self.base_len = base_len
+            self.forced_prefix_ids = forced_prefix_ids
         
-        # Logits processor to force the prefix
-        class ForcePrefixProcessor(LogitsProcessor):
-            def __init__(self, tokenizer, base_len, forced_prefix_ids):
-                super().__init__()
-                self.tokenizer = tokenizer
-                self.base_len = base_len
-                self.forced_prefix_ids = forced_prefix_ids
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+            cur_len = input_ids.shape[1]
+            gen_step = cur_len - self.base_len
             
-            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-                cur_len = input_ids.shape[1]
-                gen_step = cur_len - self.base_len
-                
-                # Force the first tokens to match "#### "
-                if 0 <= gen_step < len(self.forced_prefix_ids):
-                    forced_token_id = self.forced_prefix_ids[gen_step]
-                    # Set all scores to -inf except the forced token
-                    scores[:, :] = -float('inf')
-                    scores[:, forced_token_id] = 0
-                
-                return scores
+            # Force the first tokens to match "#### "
+            if 0 <= gen_step < len(self.forced_prefix_ids):
+                forced_token_id = self.forced_prefix_ids[gen_step]
+                # Set all scores to very low value except the forced token
+                scores[:, :] = -1e10  # Use large negative value instead of -inf
+                scores[:, forced_token_id] = 0
             
-        # Logits processor to boost digits after the prefix
-        class DigitAfterPrefixBoost(LogitsProcessor):
-            def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 4.0):
-                super().__init__()
-                self.tokenizer = tokenizer
-                self.base_len = base_len
-                self.forced_prefix_len = len(forced_prefix_ids)
-                self.boost = boost
-                # Allowed tokens: digits, decimal point, minus sign
-                digit_chars = list("0123456789") + ['.', '-']
-                self.allowed_ids = set()
-                for ch in digit_chars:
-                    ids = tokenizer.encode(ch, add_special_tokens=False)
-                    if len(ids) == 1:
-                        self.allowed_ids.add(ids[0])
-                self.allowed_ids = list(self.allowed_ids)
-                print(f"Allowed digit tokens: {self.allowed_ids}")
-            
-            def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-                cur_len = input_ids.shape[1]
-                gen_step = cur_len - self.base_len
-                
-                # Apply boost only after the "#### " prefix
-                if gen_step >= self.forced_prefix_len and self.allowed_ids:
-                    scores[:, self.allowed_ids] = scores[:, self.allowed_ids] + self.boost
-                
-                return scores
+            return scores
         
-        # Combine logits processors
-        lp = LogitsProcessorList([
-            ForcePrefixProcessor(self.tokenizer, base_len, forced_prefix_ids),
-            DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=4.0)
-        ])
+    # Logits processor to boost digits after the prefix
+    class DigitAfterPrefixBoost(LogitsProcessor):
+        def __init__(self, tokenizer, base_len, forced_prefix_ids, boost: float = 4.0):
+            super().__init__()
+            self.tokenizer = tokenizer
+            self.base_len = base_len
+            self.forced_prefix_len = len(forced_prefix_ids)
+            self.boost = boost
+            # Allowed tokens: digits, decimal point, minus sign
+            digit_chars = list("0123456789") + ['.', '-']
+            self.allowed_ids = set()
+            for ch in digit_chars:
+                ids = tokenizer.encode(ch, add_special_tokens=False)
+                if len(ids) == 1:
+                    self.allowed_ids.add(ids[0])
+            self.allowed_ids = list(self.allowed_ids)
+            print(f"Allowed digit tokens: {self.allowed_ids}")
         
-        # Anneal temperature during training
-        current_temp = max(0.3, self.config.temperature * (0.95 ** min(self.global_step, 50)))
-        print(f"Current temperature: {current_temp:.3f} (step {self.global_step})")
+        def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+            cur_len = input_ids.shape[1]
+            gen_step = cur_len - self.base_len
             
+            # Apply boost only after the "#### " prefix
+            if gen_step >= self.forced_prefix_len and self.allowed_ids:
+                # Apply boost more carefully to avoid extreme values
+                scores[:, self.allowed_ids] = scores[:, self.allowed_ids] + min(self.boost, 2.0)
+            
+            return scores
+    
+    # Combine logits processors
+    lp = LogitsProcessorList([
+        ForcePrefixProcessor(self.tokenizer, base_len, forced_prefix_ids),
+        DigitAfterPrefixBoost(self.tokenizer, base_len, forced_prefix_ids, boost=4.0)
+    ])
+    
+    # Use stable temperature
+    current_temp = max(0.3, self.config.temperature)
+    print(f"Current temperature: {current_temp:.3f} (step {self.global_step})")
+        
+    try:
+        generation_config = {
+            'max_new_tokens': self.new_tokens,
+            'min_new_tokens': 6,
+            'do_sample': self.config.do_sample,
+            'pad_token_id': self.tokenizer.eos_token_id,
+            'logits_processor': lp,
+            'bad_words_ids': self.bad_words_ids or None,
+            'repetition_penalty': 1.1,
+        }
+        
+        if self.config.do_sample:
+            generation_config.update({
+                'temperature': max(current_temp, 0.1),  # Ensure reasonable temperature
+                'top_k': self.config.top_k,
+                'top_p': self.config.top_p,
+            })
+        
+        return self.model.generate(
+            **inputs,
+            **generation_config
+        )
+    except Exception as e:
+        print(f"⚠️ Generation failed ({e}). Fallback to simple generation.")
         try:
-            if self.config.do_sample:
-                return self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.new_tokens,
-                    min_new_tokens=6,
-                    do_sample=True,
-                    temperature=max(current_temp, 1e-5),
-                    top_k=self.config.top_k,
-                    top_p=self.config.top_p,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    logits_processor=lp,
-                    bad_words_ids=self.bad_words_ids or None,
-                    repetition_penalty=1.1,
-                )
-            else:
-                return self.model.generate(
-                    **inputs,
-                    max_new_tokens=self.new_tokens,
-                    min_new_tokens=6,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    logits_processor=lp,
-                    bad_words_ids=self.bad_words_ids or None,
-                    repetition_penalty=1.1,
-                )
-        except Exception as e:
-            print(f"⚠️ Sampling failed ({e}). Fallback to greedy decoding.")
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            return self.model.generate(
-                **inputs,
-                max_new_tokens=self.new_tokens,
-                min_new_tokens=6,
-                do_sample=False,
-                pad_token_id=self.tokenizer.eos_token_id,
-                logits_processor=lp,
-                bad_words_ids=self.bad_words_ids or None,
-                repetition_penalty=1.1,
-            )
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        
+        # Use the fallback method
+        return self._generate_fallback(base_len, **inputs)
 
     def _reward(self, suffix: str, gold_str: str) -> float:
         """
@@ -406,6 +391,7 @@ class GRPOTrainerWrapper:
 
             # Tokenize prompts
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+            inputs = {k: v for k, v in inputs.items() if v is not None}
 
             # Shared input length for all prompts
             shared_in_len = inputs["input_ids"].shape[1]
