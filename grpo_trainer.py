@@ -239,20 +239,33 @@ class GRPOTrainerWrapper:
             return inputs["input_ids"]
 
     def _generate(self, base_len: int, **inputs):
-        """Simple generation without complex logits processing."""
+        """Generate model responses with enforced #### number formatting."""
         try:
-            # Very simple generation without forcing
-            return self.model.generate(
+            # Force the exact format we want
+            forced_prefix = "#### "
+            forced_prefix_ids = self.tokenizer.encode(forced_prefix, add_special_tokens=False)
+            print(f"Strictly forcing prefix: '{forced_prefix}' -> {forced_prefix_ids}")
+            
+            # Use a simpler approach: generate with prefix forcing
+            generation_output = self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
-                do_sample=self.config.do_sample,
-                temperature=max(0.5, self.config.temperature),
-                pad_token_id=self.tokenizer.eos_token_id or self.tokenizer.pad_token_id,
-                repetition_penalty=1.1,
-                eos_token_id=self.tokenizer.eos_token_id,
+                do_sample=False,  # Greedy for reliability
+                pad_token_id=self.tokenizer.eos_token_id,
+                num_return_sequences=1,
+                # Force the model to start with ####
+                forced_bos_token_id=forced_prefix_ids[0] if forced_prefix_ids else None,
             )
+            
+            # Decode and check if format is correct
+            full_output = self.tokenizer.decode(generation_output[0], skip_special_tokens=False)
+            print(f"Raw generated: {full_output[ -100:]}")  # Last 100 chars
+            
+            return generation_output
+        
         except Exception as e:
             print(f"Generation failed: {e}")
+            # Fallback: return input with basic suffix
             return inputs["input_ids"]
 
     def _reward(self, suffix: str, gold_str: str) -> float:
@@ -260,10 +273,14 @@ class GRPOTrainerWrapper:
         Calculate reward based on answer correctness with penalty for absurd numbers.
         More permissive version that accepts numbers even without exact '####' prefix.
         """
-        # Try to extract number even if format isn't perfect
+        # First, check if format is correct
+        has_correct_format = suffix.strip().startswith("####")
+        format_bonus = 0.3 if has_correct_format else 0.0
+        
+        # Try to extract number with multiple methods
         pred = extract_pred_number_from_suffix_head(suffix)
         
-        # Also try to find any number in the suffix as fallback
+        # Fallback: look for any number in the text
         if pred is None:
             numbers = RE_ANY.findall(suffix)
             if numbers:
@@ -272,32 +289,27 @@ class GRPOTrainerWrapper:
                 except (ValueError, TypeError):
                     pred = None
         
+        # If no number found, reward format only
+        if pred is None:
+            return format_bonus
+        
         try:
             gold = float(gold_str) if gold_str else None
+            if gold is None:
+                return format_bonus
             
-            if gold is None or pred is None:
-                return 0.0
-            
-            # Penalty for unreasonable numbers
-            if abs(pred) > 1000000:  # Numbers > 1 million = absurd
-                return 0.01
-            if abs(pred - gold) > 100000:  # Error > 100,000 = absurd
-                return 0.01
-                
-            # Bonus for correct format
-            format_bonus = 0.2 if suffix.strip().startswith("####") else 0.0
-            
-            # Normal reward calculation
+            # Calculate accuracy-based reward
             if pred == gold:
-                return 1.0 + format_bonus
-            elif abs(pred - gold) < 0.01:
-                return 0.8 + format_bonus
-            elif abs(pred - gold) / max(1.0, abs(gold)) < 0.1:
-                return 0.4 + format_bonus
+                return 1.0 + format_bonus  # Perfect answer
+            elif abs(pred - gold) < 0.1:
+                return 0.6 + format_bonus  # Very close
+            elif abs(pred - gold) / max(1.0, abs(gold)) < 0.2:
+                return 0.3 + format_bonus  # Somewhat close
             else:
-                return 0.1 + format_bonus
+                return 0.1 + format_bonus  # Wrong but tried
+                
         except (ValueError, TypeError):
-            return 0.0
+            return format_bonus  # Reward format only
         
     
     def train(self, dataloader: DataLoader):
