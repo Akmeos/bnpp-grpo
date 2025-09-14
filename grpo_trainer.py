@@ -301,117 +301,139 @@ class GRPOTrainerWrapper:
         
     
     def train(self, dataloader: DataLoader):
-        """Main training loop for GRPO."""
+        """Main training loop for GRPO with maximum robustness."""
         self.model.train()
         device = next(self.model.parameters()).device
-
+    
         for step, batch in enumerate(dataloader):
             if step >= self.max_steps:
                 break
-
+    
             prompts = batch["prompts"]
             golds = batch["answers"]
-
-            # Tokenize prompts
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
-            inputs = {k: v for k, v in inputs.items() if v is not None}
-
-            # Shared input length for all prompts
+    
+            try:
+                # Tokenize on CPU first
+                inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
+                inputs = {k: v for k, v in inputs.items() if v is not None}
+            except Exception as e:
+                print(f"Tokenization error: {e}")
+                continue
+    
+            if "input_ids" not in inputs or inputs["input_ids"].numel() == 0:
+                print("Invalid inputs, skipping batch")
+                continue
+    
+            # Move to device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
             shared_in_len = inputs["input_ids"].shape[1]
-
-            # Generate suffixes (with digit boost + bad words filtering)
-            with torch.no_grad():
-                outputs = self._generate(shared_in_len, **inputs)  # [B, shared_in_len + new]
-
-            # Extract suffixes (tokens after shared_in_len)
+    
+            # Generation with error handling
+            try:
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=self.new_tokens,
+                        do_sample=False,  # Greedy for stability
+                        pad_token_id=self.tokenizer.eos_token_id,
+                    )
+            except Exception as e:
+                print(f"Generation failed: {e}")
+                continue
+    
+            # Extract suffixes on CPU
             suffixes = []
             for i in range(outputs.size(0)):
                 if outputs.size(1) > shared_in_len:
-                    suf_ids = outputs[i, shared_in_len:]
+                    suf_ids = outputs[i, shared_in_len:].cpu()
                 else:
-                    suf_ids = outputs[i, 0:0]  # Empty tensor
+                    suf_ids = outputs[i, 0:0].cpu()
                 suffix_text = self.tokenizer.decode(suf_ids, skip_special_tokens=True)
                 suffixes.append(suffix_text)
-                
-                # Debug: show what was actually generated
-                if i == 0 and step % 2 == 0:  # Print first sample every 2 steps
-                    full_output = self.tokenizer.decode(outputs[i], skip_special_tokens=False)
-                    print(f"Full generated: {full_output}")
-                    print(f"Extracted suffix: '{suffix_text}'")
-
+    
             # Calculate rewards
-            rewards_list = [self._reward(suf, gold) for suf, gold in zip(suffixes, golds)]
-            rewards = torch.tensor(rewards_list, dtype=torch.float32, device=device)
-            rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
-            
-            if step % 5 == 0:  # Print only every 5 steps
-                print(f"=== DEBUG Step {step} ===")
-                print(f"Suffix: '{suffixes[0]}'")
-                print(f"Extracted number: {extract_pred_number_from_suffix_head(suffixes[0])}")
-                print(f"Gold number: {golds[0]}")
-                print(f"Reward: {rewards_list[0]}")
-                print("========================")
-
-            # Debug first batch
-            if self.config.debug_print_first_batch and step == 0:
-                print("=== DEBUG batch 0 ===")
-                for i in range(min(3, len(prompts))):
-                    print("SUFFIX GENERATED ↓")
-                    print(suffixes[i][:200].replace("\n", "\\n"))
-                    print("LABEL =", golds[i])
-                    print("REWARD =", rewards_list[i])
-                print("=====================")
-
-            # Skip update if all rewards are zero
+            rewards_list = []
+            for suf, gold in zip(suffixes, golds):
+                try:
+                    reward = self._reward(suf, gold)
+                    rewards_list.append(reward)
+                except Exception:
+                    rewards_list.append(0.0)
+    
+            # === CORRECTION CRITIQUE ===
+            # Create tensor on CPU first, then move to device
+            try:
+                rewards_cpu = torch.tensor(rewards_list, dtype=torch.float32)
+                rewards = rewards_cpu.to(device)
+                rewards = torch.clamp(torch.nan_to_num(rewards, nan=0.0), 0.0, 1.0)
+            except Exception as e:
+                print(f"Reward tensor creation failed: {e}")
+                continue
+    
             if float(rewards.sum().item()) == 0.0:
-                if self.writer:
-                    self.writer.add_scalar("reward/mean", 0.0, self.global_step)
-                    self.writer.add_scalar("reward/std", 0.0, self.global_step)
                 if step % 10 == 0:
                     print(f"[Step {step}] skip update (all rewards=0)")
                 self.global_step += 1
                 continue
-
-            advantages = self.compute_advantages(rewards)
-
-            # Re-tokenize suffixes (policy & ref on same text)
-            outs = self.tokenizer(suffixes, return_tensors="pt", padding=True, truncation=True).to(device)
-
+    
+            # Re-tokenize suffixes on CPU
+            try:
+                outs = self.tokenizer(suffixes, return_tensors="pt", padding=True, truncation=True)
+                outs = {k: v.to(device) for k, v in outs.items() if v is not None}
+            except Exception as e:
+                print(f"Re-tokenization failed: {e}")
+                continue
+    
             # Current policy logits
-            logits = self.model(**outs).logits
-            logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-            logprobs = F.log_softmax(logits, dim=-1)
-            logprobs = torch.clamp(torch.nan_to_num(logprobs, nan=-20.0), min=-20, max=0)
-            gen_logprobs = logprobs[:, -1, :].gather(1, outs["input_ids"][:, -1].unsqueeze(-1)).squeeze()
-
+            try:
+                logits = self.model(**outs).logits
+                logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+                logprobs = F.log_softmax(logits, dim=-1)
+                logprobs = torch.clamp(torch.nan_to_num(logprobs, nan=-20.0), min=-20, max=0)
+                gen_logprobs = logprobs[:, -1, :].gather(1, outs["input_ids"][:, -1].unsqueeze(-1)).squeeze()
+            except Exception as e:
+                print(f"Logits calculation failed: {e}")
+                continue
+    
             # Reference logprobs
-            with torch.no_grad():
-                ref_logits = self.ref_model(**outs).logits
-                ref_logits = torch.nan_to_num(ref_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
-                ref_lp_all = F.log_softmax(ref_logits, dim=-1)
-                ref_lp_all = torch.clamp(torch.nan_to_num(ref_lp_all, nan=-20.0), min=-20, max=0)
-            ref_logprobs = ref_lp_all[:, -1, :].gather(1, outs["input_ids"][:, -1].unsqueeze(-1)).squeeze()
-
+            try:
+                with torch.no_grad():
+                    ref_logits = self.ref_model(**outs).logits
+                    ref_logits = torch.nan_to_num(ref_logits.float(), nan=0.0, posinf=20.0, neginf=-20.0)
+                    ref_lp_all = F.log_softmax(ref_logits, dim=-1)
+                    ref_lp_all = torch.clamp(torch.nan_to_num(ref_lp_all, nan=-20.0), min=-20, max=0)
+                ref_logprobs = ref_lp_all[:, -1, :].gather(1, outs["input_ids"][:, -1].unsqueeze(-1)).squeeze()
+            except Exception as e:
+                print(f"Reference logprobs failed: {e}")
+                continue
+    
             # PPO loss calculation
-            ratio = torch.exp(torch.clamp(gen_logprobs - ref_logprobs, min=-20, max=20))
-            unclipped = ratio * advantages
-            clipped = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
-            policy_loss = -torch.min(unclipped, clipped).mean()
-
-            # KL + Entropy regularization
-            kl_loss = self.kl_penalty(gen_logprobs, ref_logprobs)
-            entropy = -(logprobs[:, -1, :].exp() * logprobs[:, -1, :]).sum(-1).mean()
-            entropy_bonus = -self.config.entropy_coef * entropy
-            loss = policy_loss + kl_loss + entropy_bonus
-
-            # Optimization step
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-            self.optimizer.step()
-            self.scheduler.step()
+            try:
+                ratio = torch.exp(torch.clamp(gen_logprobs - ref_logprobs, min=-20, max=20))
+                advantages = self.compute_advantages(rewards)
+                unclipped = ratio * advantages
+                clipped = torch.clamp(ratio, 1 - self.config.clip_range, 1 + self.config.clip_range) * advantages
+                policy_loss = -torch.min(unclipped, clipped).mean()
+    
+                # KL + Entropy regularization
+                kl_loss = self.kl_penalty(gen_logprobs, ref_logprobs)
+                entropy = -(logprobs[:, -1, :].exp() * logprobs[:, -1, :]).sum(-1).mean()
+                entropy_bonus = -self.config.entropy_coef * entropy
+                loss = policy_loss + kl_loss + entropy_bonus
+    
+                # Optimization step
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
+                self.scheduler.step()
+    
+            except Exception as e:
+                print(f"Loss calculation failed: {e}")
+                continue
+    
             self.global_step += 1
-
+    
             # Logging
             if self.writer:
                 self.writer.add_scalar("loss/policy", float(policy_loss.item()), self.global_step)
@@ -420,27 +442,18 @@ class GRPOTrainerWrapper:
                 self.writer.add_scalar("loss/total", float(loss.item()), self.global_step)
                 self.writer.add_scalar("reward/mean", float(rewards.mean().item()), self.global_step)
                 self.writer.add_scalar("reward/std", self._std_safe(rewards), self.global_step)
-                self.writer.add_scalar("clip/ratio_mean", float(ratio.mean().item()), self.global_step)
-
+    
             if step % 10 == 0:
                 print(
                     f"[Step {step}] loss={float(loss.item()):.4f} "
                     f"reward_mean={float(rewards.mean().item()):.3f} "
-                    f"clip_ratio_mean={float(ratio.mean().item()):.3f} "
                     f"entropy={float(entropy.item()):.3f}"
                 )
-                
-            if step % 5 == 0:
-                print(f"Prompt: {prompts[0][-50:]}...")
-                print(f"Suffix: '{suffixes[0]}'")
-                print(f"Gold: {golds[0]}")
-                print(f"Pred extracted: {extract_pred_number_from_suffix_head(suffixes[0])}")
-                print(f"Reward: {rewards_list[0]}")
-                print("---")
-
+    
             if step > 0 and step % self.config.save_steps == 0:
                 self._save_checkpoint(step)
-
+    
+        # Final save
         os.makedirs(self.output_dir, exist_ok=True)
         self.model.save_pretrained(self.output_dir)
         self.tokenizer.save_pretrained(self.output_dir)
