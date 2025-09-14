@@ -497,4 +497,4 @@ class GRPOTrainerWrapper:
         os.makedirs(self.output_dir, exist_ok=True)
         self.model.save_pretrained(self.output_dir)
         self.tokenizer.save_pretrained(self.output_dir)
-        print(f"✅ Training completed. Model saved in {self.output_dir}")
+        print(f"Training completed. Model saved in {self.output_dir}")
