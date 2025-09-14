@@ -219,7 +219,35 @@ class GRPOTrainerWrapper:
         os.makedirs(ckpt_path, exist_ok=True)
         self.model.save_pretrained(ckpt_path)
         self.tokenizer.save_pretrained(ckpt_path)
-        print(f"💾 Checkpoint saved: {ckpt_path}")
+        print(f" Checkpoint saved: {ckpt_path}")
+    
+    def _generate_fallback(self, base_len: int, **inputs):
+        """
+        Fallback generation method when sampling fails.
+        Uses greedy decoding as a robust alternative.
+        """
+        print("Using fallback generation method (greedy decoding)")
+        
+        try:
+            # Use simple greedy decoding without logits processors
+            generation_config = GenerationConfig(
+                max_new_tokens=self.new_tokens,
+                min_new_tokens=6,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+            )
+            
+            return self.model.generate(
+                **inputs,
+                generation_config=generation_config,
+                return_dict_in_generate=True,
+                output_scores=False,
+            ).sequences
+        except Exception as e:
+            print(f"Fallback generation also failed: {e}")
+            # Return the original input as last resort to avoid complete failure
+            return inputs["input_ids"]
 
     def _generate(self, base_len: int, **inputs):
         """Generate text with forced prefix and digit boosting."""
@@ -379,7 +407,7 @@ class GRPOTrainerWrapper:
             # Tokenize prompts
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
 
-            # ✅ Shared input length for all prompts
+            # Shared input length for all prompts
             shared_in_len = inputs["input_ids"].shape[1]
 
             # Generate suffixes (with digit boost + bad words filtering)
