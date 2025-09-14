@@ -47,10 +47,7 @@ def clean_answer(answer_text: str) -> str:
 
 
 # Instruction prompt with strict output formatting
-INSTRUCTION_PROMPT = (
-    "Answer with ONLY the number in this format: #### number\n"
-    "No text, no explanation, just #### followed by the number.\n"
-)
+INSTRUCTION_PROMPT = "Answer: #### "
 
 
 def get_dataloaders(
@@ -90,7 +87,7 @@ def get_dataloaders(
         clean_ans = clean_answer(example["answer"])
         
         # Construct prompt with forced output format
-        prompt = f"Q: {question}\nA: #### "
+        prompt = f"{question}\n#### "
         prompts.append(prompt)
         answers.append(clean_ans)
 

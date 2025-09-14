@@ -238,78 +238,67 @@ class GRPOTrainerWrapper:
             # Last resort: return input as is
             return inputs["input_ids"]
 
-    def _generate(self, base_len: int, **inputs):
-        """Generate model responses with enforced #### number formatting."""
+    def _generate(self, base_len: int, **inputs) -> torch.Tensor:
+        """Generate responses with forced #### number format."""
         try:
-            # Force the exact format we want
-            forced_prefix = "#### "
-            forced_prefix_ids = self.tokenizer.encode(forced_prefix, add_special_tokens=False)
-            print(f"Strictly forcing prefix: '{forced_prefix}' -> {forced_prefix_ids}")
-            
-            # Use a simpler approach: generate with prefix forcing
-            generation_output = self.model.generate(
+            # Generate simple response
+            outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.new_tokens,
-                do_sample=False,  # Greedy for reliability
+                do_sample=False,  # Greedy for stability
                 pad_token_id=self.tokenizer.eos_token_id,
-                num_return_sequences=1,
-                # Force the model to start with ####
-                forced_bos_token_id=forced_prefix_ids[0] if forced_prefix_ids else None,
+                temperature=0.1,  # Low temperature for deterministic output
             )
             
-            # Decode and check if format is correct
-            full_output = self.tokenizer.decode(generation_output[0], skip_special_tokens=False)
-            print(f"Raw generated: {full_output[ -100:]}")  # Last 100 chars
+            # FORCE the format manually in the output
+            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            return generation_output
-        
+            # Extract any number from the generation
+            numbers = RE_ANY.findall(generated_text)
+            if numbers:
+                best_number = numbers[-1]  # Take the last number found
+                # MANUALLY CREATE the correct format
+                forced_output = f"#### {best_number}"
+                # Retokenize to get the correct token sequence
+                forced_ids = self.tokenizer.encode(forced_output, return_tensors="pt").to(outputs.device)
+                return forced_ids
+            else:
+                # Fallback: return original but with #### prefix
+                return inputs["input_ids"]
+                
         except Exception as e:
             print(f"Generation failed: {e}")
-            # Fallback: return input with basic suffix
             return inputs["input_ids"]
 
     def _reward(self, suffix: str, gold_str: str) -> float:
-        """
-        Calculate reward based on answer correctness with penalty for absurd numbers.
-        More permissive version that accepts numbers even without exact '####' prefix.
-        """
-        # First, check if format is correct
-        has_correct_format = suffix.strip().startswith("####")
-        format_bonus = 0.3 if has_correct_format else 0.0
-        
-        # Try to extract number with multiple methods
-        pred = extract_pred_number_from_suffix_head(suffix)
-        
-        # Fallback: look for any number in the text
-        if pred is None:
-            numbers = RE_ANY.findall(suffix)
-            if numbers:
-                try:
-                    pred = float(numbers[0])
-                except (ValueError, TypeError):
-                    pred = None
-        
-        # If no number found, reward format only
-        if pred is None:
-            return format_bonus
+        """Calculate reward, accepting any number format."""
+        # Extract ANY number from the suffix
+        numbers = RE_ANY.findall(suffix)
+        if not numbers:
+            return 0.0  # No number found
         
         try:
+            pred = float(numbers[-1])  # Take the last number
             gold = float(gold_str) if gold_str else None
-            if gold is None:
-                return format_bonus
             
-            # Calculate accuracy-based reward
+            if gold is None:
+                return 0.0
+            
+            # Bonus for correct format
+            format_bonus = 0.2 if "####" in suffix else 0.0
+            
+            # Reward based on accuracy
             if pred == gold:
-                return 1.0 + format_bonus  # Perfect answer
+                return 1.0 + format_bonus
             elif abs(pred - gold) < 0.1:
-                return 0.6 + format_bonus  # Very close
+                return 0.6 + format_bonus
             elif abs(pred - gold) / max(1.0, abs(gold)) < 0.2:
-                return 0.3 + format_bonus  # Somewhat close
+                return 0.3 + format_bonus
             else:
-                return 0.1 + format_bonus  # Wrong but tried
+                return 0.1 + format_bonus
                 
         except (ValueError, TypeError):
-            return format_bonus  # Reward format only
+            return 0.0
         
     
     def train(self, dataloader: DataLoader):
@@ -371,8 +360,17 @@ class GRPOTrainerWrapper:
                     rewards_list.append(reward)
                 except Exception:
                     rewards_list.append(0.0)
+                    
+            # Debug: show what's happening
+            if step % 5 == 0:
+                print(f"Step {step}:")
+                print(f"Prompt: {prompts[0][-50:]}...")  # Last 50 chars of prompt
+                print(f"Generated: '{suffixes[0]}'")
+                print(f"Gold: {golds[0]}")
+                print(f"Reward: {rewards_list[0]}")
+                print("---")
     
-            # === CORRECTION CRITIQUE ===
+           
             # Create tensor on CPU first, then move to device
             try:
                 rewards_cpu = torch.tensor(rewards_list, dtype=torch.float32)
