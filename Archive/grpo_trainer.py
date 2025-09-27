@@ -19,7 +19,6 @@ from torch.optim import AdamW
 from transformers import get_scheduler
 from transformers.generation.logits_process import LogitsProcessorList, LogitsProcessor
 from transformers import GenerationConfig
-from utils.memory import report_memory
 
 # === Regex utilities for number extraction ===
 RE_BEGIN_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")       # Number at BEGINNING of suffix
@@ -339,8 +338,6 @@ class GRPOTrainerWrapper:
                         do_sample=False,  # Greedy for stability
                         pad_token_id=self.tokenizer.eos_token_id,
                     )
-                # Measure GPU memory after forward pass (activations live here)
-                report_memory("After forward (activations)")
             except Exception as e:
                 print(f"Generation failed: {e}")
                 continue
@@ -404,8 +401,6 @@ class GRPOTrainerWrapper:
                 logprobs = F.log_softmax(logits, dim=-1)
                 logprobs = torch.clamp(torch.nan_to_num(logprobs, nan=-20.0), min=-20, max=0)
                 gen_logprobs = logprobs[:, -1, :].gather(1, outs["input_ids"][:, -1].unsqueeze(-1)).squeeze()
-                # Memory snapshot after logits (still forward activations)
-                report_memory("After logits (activations + temporary buffers)")
             except Exception as e:
                 print(f"Logits calculation failed: {e}")
                 continue
@@ -439,15 +434,9 @@ class GRPOTrainerWrapper:
                 # Optimization step
                 self.optimizer.zero_grad()
                 loss.backward()
-                # Memory snapshot after backward (gradients are materialized)
-                report_memory("After backward (gradients)")
-                
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
                 self.scheduler.step()
-                
-                # Memory snapshot after optimizer update (moments / Adam states)
-                report_memory("After optimizer step (moments)")
     
             except Exception as e:
                 print(f"Loss calculation failed: {e}")

@@ -15,7 +15,6 @@ from torch.utils.tensorboard import SummaryWriter
 from data_loader import get_dataloaders
 from model_loader import load_model_and_tokenizer
 from grpo_trainer import GRPOConfig, GRPOTrainerWrapper
-from utils.memory import report_memory
 
 
 def set_seed(seed: int = 42):
@@ -77,7 +76,6 @@ def main():
     # --- Model and Tokenizer Loading ---
     print("Loading model and tokenizer...")
     model, tokenizer = load_model_and_tokenizer()
-    report_memory("After model load (weights)")
 
     # --- Dataset Preparation ---
     print("Preparing GSM8K dataset...")
@@ -89,13 +87,6 @@ def main():
         max_input_tokens=768,   # Reasonable input length for math problems
     )
     print(f"Dataset loaded with {len(train_loader)} samples")
-    
-    # --- Memory check: inference phase (KV cache) ---
-    print("Running a dry-run inference to measure KV cache usage...")
-    sample_batch = next(iter(train_loader))
-    inputs = tokenizer(sample_batch["prompts"], return_tensors="pt").to(model.device)
-    _ = model.generate(inputs["input_ids"], max_new_tokens=32)
-    report_memory("During inference (KV cache + activations)")
 
     # --- GRPO Configuration ---
     cfg = GRPOConfig(

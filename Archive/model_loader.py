@@ -8,7 +8,6 @@ Handles model loading, tokenizer setup, and parameter freezing strategy.
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
-from utils.memory import report_memory
 
 
 def load_model_and_tokenizer(model_name: str = "ibm-granite/granite-3.1-1b-a400m-instruct"):
@@ -43,8 +42,6 @@ def load_model_and_tokenizer(model_name: str = "ibm-granite/granite-3.1-1b-a400m
         torch_dtype=torch.float16,  # FP16 for memory efficiency
         device_map="auto",          # Automatic device placement
     )
-    print("Model loaded.")
-    report_memory("After model load (weights)")
 
     # --- Parameter Freezing Strategy ---
     # Freeze all parameters initially
