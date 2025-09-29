@@ -132,38 +132,37 @@ def main():
 
     # Override trainer reward function with tolerant one
     def tolerant_reward_fn(suffix: str, gold_str: str) -> float:
-        """
-        Reward with tolerance:
-        - Exact match: 1.0
-        - Within 10%: 0.6
-        - Within 30%: 0.3
-        - Wrong but numeric: 0.1
-        - No number: 0.0
-        """
         import re
         RE_ANY = re.compile(r"-?\d+(?:\.\d+)?")
-
         numbers = RE_ANY.findall(suffix)
         if not numbers:
             return 0.0
-
-        try:
-            pred = float(numbers[-1])
-            gold = float(gold_str) if gold_str else None
-            if gold is None:
-                return 0.0
-
-            diff = abs(pred - gold)
-            if pred == gold:
-                return 1.0
-            elif diff <= 0.1 * abs(gold):
-                return 0.6
-            elif diff <= 0.3 * abs(gold):
-                return 0.3
-            else:
-                return 0.1
-        except Exception:
+    
+        pred = float(numbers[-1])
+        gold = float(gold_str) if gold_str else None
+        if gold is None:
             return 0.0
+    
+        diff = abs(pred - gold)
+        reward = 0.0
+    
+        if pred == gold:
+            reward = 1.0
+        elif diff <= 0.1 * abs(gold):
+            reward = 0.6
+        elif diff <= 0.3 * abs(gold):
+            reward = 0.3
+        else:
+            reward = 0.1
+    
+        # Format bonuses
+        if suffix.strip().startswith("####"):
+            reward += 0.2
+        elif numbers:
+            reward += 0.1
+    
+        return reward
+
 
     # Inject reward function into trainer
     trainer._reward = tolerant_reward_fn
