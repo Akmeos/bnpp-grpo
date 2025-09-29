@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Main training script for GRPO (Grouped Reinforcement Policy Optimization) on GSM8K.
-Handles argument parsing, configuration setup, and training pipeline initialization.
+Main training script for GRPO (Grouped Reinforcement Policy Optimization)
+on GSM8K math reasoning tasks.
 
-Improvements:
- - Explicit attention_mask handling (fix empty generations)
- - Custom reward function with regex check on last number
+Includes:
+- Robust seeding
+- Metadata logging
+- Custom tolerant reward function
+- GRPO trainer with PPO-like updates
 """
 
 import argparse
 import os
 import random
-import re
 import numpy as np
 import torch
-
 from torch.utils.tensorboard import SummaryWriter
+
 from data_loader import get_dataloaders
 from model_loader import load_model_and_tokenizer
 from grpo_trainer import GRPOConfig, GRPOTrainerWrapper
@@ -26,6 +27,9 @@ from utils.memory import report_memory
 def set_seed(seed: int = 42):
     """
     Set all random seeds for reproducibility across all libraries.
+
+    Args:
+        seed: Random seed value (default: 42)
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -36,25 +40,9 @@ def set_seed(seed: int = 42):
     print(f" Global seed set to {seed}")
 
 
-def reward_function(output: str, gold: int) -> float:
-    """
-    Custom reward function.
-    Reward = 1 if the last number in the model output matches the gold label.
-    Reward = 0 otherwise.
-    """
-    numbers = re.findall(r"\d+", output)
-    if not numbers:
-        return 0.0
-    try:
-        return 1.0 if int(numbers[-1]) == gold else 0.0
-    except ValueError:
-        return 0.0
-
-
 def main():
-    # -----------------------
-    # Argument parsing
-    # -----------------------
+    """Main entry point for GRPO training."""
+    # === Argument Parsing ===
     parser = argparse.ArgumentParser(description="GRPO Training for GSM8K Math Reasoning")
 
     parser.add_argument("--output_dir", type=str, default="outputs/grpo-granite",
@@ -71,26 +59,18 @@ def main():
                         help="Sampling temperature for generation")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
-    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
-                        help="Path to checkpoint to resume training from")
 
     args = parser.parse_args()
 
-    # -----------------------
-    # Seed setup
-    # -----------------------
+    # === Seed Setup ===
     set_seed(args.seed)
 
-    # -----------------------
-    # Logging setup
-    # -----------------------
+    # === Logging Setup ===
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=args.log_dir)
     print(f"TensorBoard logging enabled in {args.log_dir}")
 
-    # -----------------------
-    # Metadata storage
-    # -----------------------
+    # === Metadata Storage ===
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "run_meta.json"), "w") as f:
         f.write(
@@ -99,69 +79,46 @@ def main():
         )
     print(f"Run metadata saved to {args.output_dir}/run_meta.json")
 
-    # -----------------------
-    # Model and tokenizer
-    # -----------------------
+    # === Model and Tokenizer Loading ===
     print("Loading model and tokenizer...")
     model, tokenizer = load_model_and_tokenizer()
     report_memory("After model load (weights)")
 
-    # -----------------------
-    # Dataset preparation
-    # -----------------------
+    # === Dataset Preparation ===
     print("Preparing GSM8K dataset...")
     train_loader = get_dataloaders(
         tokenizer,
         num_samples=args.samples,
-        batch_size=1,            # RL training = batch size 1
+        batch_size=1,           # RL training → batch size = 1
         shuffle=True,
-        max_input_tokens=768,
+        max_input_tokens=768,   # Reasonable input length for math problems
     )
     print(f"Dataset loaded with {len(train_loader)} samples")
 
-    # -----------------------
-    # Dry-run inference test
-    # -----------------------
+    # === Dry Run for KV Cache Check ===
     print("Running a dry-run inference to measure KV cache usage...")
     sample_batch = next(iter(train_loader))
-
-    # ✅ Add attention_mask explicitly
-    inputs = tokenizer(
-        sample_batch["prompts"],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    ).to(model.device)
-    inputs["attention_mask"] = (inputs["input_ids"] != tokenizer.pad_token_id).long()
-
-    _ = model.generate(
-        inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
-        max_new_tokens=32,
-    )
+    inputs = tokenizer(sample_batch["prompts"], return_tensors="pt").to(model.device)
+    _ = model.generate(inputs["input_ids"], max_new_tokens=32)
     report_memory("During inference (KV cache + activations)")
 
-    # -----------------------
-    # GRPO configuration
-    # -----------------------
+    # === GRPO Configuration ===
     cfg = GRPOConfig(
-        learning_rate=5e-5,
-        weight_decay=0.01,
-        warmup_steps=50,
-        max_grad_norm=1.0,
-        clip_range=0.2,
-        kl_coef=0.05,
-        entropy_coef=0.001,
+        learning_rate=5e-5,     # Stable learning rate for T4 GPU
+        weight_decay=0.01,      # L2 regularization
+        warmup_steps=50,        # LR warmup
+        max_grad_norm=1.0,      # Gradient clipping
+        clip_range=0.2,         # PPO clip range
+        kl_coef=0.05,           # KL divergence coefficient
+        entropy_coef=0.001,     # Small entropy bonus
         normalize_rewards=True,
-        save_steps=50,
-        do_sample=True,
+        save_steps=50,          # Save every 50 steps
+        do_sample=True,         # Enable sampling
         temperature=args.temperature,
     )
 
-    # -----------------------
-    # Trainer init
-    # -----------------------
-    print("Initializing GRPO trainer...")
+    # === Trainer Initialization ===
+    print("Initializing GRPO trainer with tolerant reward...")
     trainer = GRPOTrainerWrapper(
         model=model,
         tokenizer=tokenizer,
@@ -171,12 +128,47 @@ def main():
         new_tokens=args.new_tokens,
         writer=writer,
         config=cfg,
-        reward_fn=reward_function,  # ✅ custom reward function
     )
 
-    # -----------------------
-    # Training execution
-    # -----------------------
+    # Override trainer reward function with tolerant one
+    def tolerant_reward_fn(suffix: str, gold_str: str) -> float:
+        """
+        Reward with tolerance:
+        - Exact match: 1.0
+        - Within 10%: 0.6
+        - Within 30%: 0.3
+        - Wrong but numeric: 0.1
+        - No number: 0.0
+        """
+        import re
+        RE_ANY = re.compile(r"-?\d+(?:\.\d+)?")
+
+        numbers = RE_ANY.findall(suffix)
+        if not numbers:
+            return 0.0
+
+        try:
+            pred = float(numbers[-1])
+            gold = float(gold_str) if gold_str else None
+            if gold is None:
+                return 0.0
+
+            diff = abs(pred - gold)
+            if pred == gold:
+                return 1.0
+            elif diff <= 0.1 * abs(gold):
+                return 0.6
+            elif diff <= 0.3 * abs(gold):
+                return 0.3
+            else:
+                return 0.1
+        except Exception:
+            return 0.0
+
+    # Inject reward function into trainer
+    trainer._reward = tolerant_reward_fn
+
+    # === Training Execution ===
     print("Starting training...")
     print("=" * 60)
     trainer.train(train_loader)
